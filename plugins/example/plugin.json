@@ -1,0 +1,7 @@
+{
+  "name": "example",
+  "version": "0.1.0",
+  "description": "A minimal local plugin example.",
+  "entrypoint": "plugin.py:create_plugin",
+  "enabled": true
+}

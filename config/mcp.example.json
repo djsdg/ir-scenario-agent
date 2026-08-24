@@ -1,0 +1,12 @@
+{
+  "servers": [
+    {
+      "server_label": "my-remote-mcp",
+      "server_url": "https://your-mcp-server.example.com/mcp",
+      "server_description": "A trusted remote MCP server.",
+      "allowed_tools": ["search", "lookup"],
+      "authorization": "${MCP_AUTH_TOKEN}",
+      "require_approval": "always"
+    }
+  ]
+}

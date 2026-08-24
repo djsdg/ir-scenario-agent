@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "name": "IR→SC→UC需求分析规范",
+  "pipeline": ["IR", "SC", "UC", "FUNCTION_IMPACT", "SR"],
+  "relationship_constraints": {
+    "ir_to_scenario": "one_to_many",
+    "scenario_to_use_case": "one_to_many",
+    "use_case_parent": "exactly_one_scenario"
+  },
+  "categories": ["Scenario Directory", "Scenario", "派生场景"],
+  "workflow_statuses": ["Draft", "Inwork", "Review", "Publish", "Obsolete"],
+  "default_workflow_status": "Draft",
+  "default_category": "派生场景",
+  "hard_required_scenario_fields": [
+    "description",
+    "category",
+    "business_goal",
+    "actor",
+    "actions",
+    "influence_factors",
+    "lifecycle",
+    "constraints",
+    "owner"
+  ],
+  "hard_required_uc_fields": [
+    "description",
+    "actor",
+    "preconditions",
+    "trigger_event",
+    "success_guarantee",
+    "minimum_guarantee",
+    "main_success_scenario"
+  ],
+  "influence_factor_dimensions": {
+    "environment": [
+      {
+        "id": "hardware_environment",
+        "name": "硬件环境",
+        "examples": ["接口卡", "硬盘", "控制器", "硬盘框", "部件", "节点"]
+      },
+      {
+        "id": "network_topology",
+        "name": "组网场景",
+        "examples": ["前端网络", "复制组网", "管理网络", "Scale out", "Scale up", "组网"]
+      },
+      {
+        "id": "protocol_connection",
+        "name": "协议连接",
+        "examples": ["文件协议", "块协议", "对象协议", "协议", "接口"]
+      }
+    ],
+    "activity": [
+      {
+        "id": "storage_architecture",
+        "name": "存储架构",
+        "examples": ["物理架构", "客户端架构", "集群架构", "架构"]
+      },
+      {
+        "id": "business_scenario",
+        "name": "业务场景",
+        "examples": ["文件服务", "块服务", "对象服务", "读", "写", "配额"]
+      },
+      {
+        "id": "operations",
+        "name": "运维场景",
+        "examples": ["灌装", "配置", "升级", "扩容", "维护", "退网", "修复", "恢复", "隔离", "告警"]
+      }
+    ]
+  },
+  "ir_to_scenario_mapping": [
+    {"from": "when", "to": "lifecycle"},
+    {"from": "where", "to": "influence_factors"},
+    {"from": "who", "to": "actor"},
+    {"from": "what+how", "to": "business_goal+actions"},
+    {"from": "how_much", "to": "constraints+dfx"},
+    {"from": "constraints", "to": "constraints"}
+  ],
+  "identification_views": [
+    "人机交互",
+    "设备交互",
+    "系统外部接口",
+    "系统边界",
+    "运维场景",
+    "周边设备/工具"
+  ],
+  "quality_outputs": [
+    "明确场景",
+    "功能规格",
+    "备选方案",
+    "功能影响分析",
+    "特性DFX"
+  ],
+  "forbidden_patterns": [
+    "把模块作为场景",
+    "把IR直接作为场景",
+    "个人临时建场景"
+  ],
+  "default_owner": null
+}

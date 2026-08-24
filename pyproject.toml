@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ir-scenario-agent"
+version = "0.1.0"
+description = "A lightweight IR requirement agent for matching and creating scenario-library entries."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=1.68.0",
+  "pydantic>=2.8.0",
+  "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.8.0",
+]
+docs = [
+  "python-docx>=1.1.0",
+  "pypdf>=5.0.0",
+]
+tui = [
+  "textual>=0.50.0",
+]
+
+[project.scripts]
+ir-agent = "ir_agent.cli:main"
+ir-agent-tui = "ir_agent.tui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

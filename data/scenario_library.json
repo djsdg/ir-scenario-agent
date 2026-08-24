@@ -1,0 +1,840 @@
+{
+  "version": 2,
+  "requirements": [
+    {
+      "code": "IR-XXXX-001",
+      "title": "【DFX】某指令异常检测机制改进",
+      "description": "系统正常运行时，某部件出现异常并导致关键进程反复复位、校验错误或数据不一致。系统需要依据故障表现检测异常，对明确异常执行复位修复或下电隔离，对反复进程复位在排除软件干扰后修复或恢复节点。",
+      "source": "项目与提出人（已脱敏）",
+      "owner": null,
+      "who": "本系统",
+      "when": "系统正常运行时，某部件出现异常",
+      "where": "系统的某部件",
+      "what": "改进某指令异常检测机制",
+      "how": [
+        "根据反复复位、校验错误或数据不一致等故障表现检测异常",
+        "对明确异常执行复位修复或下电隔离",
+        "对反复进程复位在排除软件异常干扰后修复或恢复节点",
+        "仅监控 IO 进程异常"
+      ],
+      "why": "当前检测机制不能有效检测全部异常，可能导致关键进程反复复位或数据不一致",
+      "how_much": [
+        "非明确异常一个月只处理一个节点",
+        "检测能力提升",
+        "检测到异常后产生告警",
+        "检测阈值可调整",
+        "对性能无影响"
+      ],
+      "constraints": [
+        "进程异常只监控 IO 进程",
+        "检测为事后检测，不能保证数据不损坏",
+        "数据修复不在本 IR 范围",
+        "根据复位表现判断可能误判并提高器件故障率"
+      ],
+      "performance": "对性能无影响",
+      "reliability": "检测能力提升",
+      "serviceability": "检测到异常后产生告警",
+      "maintainability": "检测阈值可以调整",
+      "sales": "不涉及",
+      "delivery_time": null,
+      "tags": [
+        "DFX",
+        "异常检测",
+        "故障隔离",
+        "IO进程"
+      ],
+      "id": "IR-XXXX-001",
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    },
+    {
+      "code": "IR-TEST-001",
+      "title": "【DFX】单节点 IO 进程反复复位异常检测与隔离改进",
+      "description": "系统正常运行时，类型 A 部件可能出现异常，导致单节点 IO 进程反复 core 或复位，也可能出现校验错误和数据不一致。现有检测机制不能覆盖全部异常，需要根据故障表现识别异常，并在确认后对节点执行复位修复、恢复或下电隔离，同时产生告警。",
+      "source": "测试项目与提出人（脱敏）",
+      "owner": "脱敏责任人",
+      "who": "本系统",
+      "when": "系统正常运行时，目标部件出现异常；单节点 IO 进程在观察窗口内反复 core 或复位。",
+      "where": "系统中的类型 A 部件及其所在节点，重点关注 IO 进程。",
+      "what": "改进单节点 IO 进程反复 core 或复位的异常检测、节点修复和隔离机制。",
+      "how": [
+        "采集单节点 IO 进程的 core、复位、校验错误和数据不一致等故障表现。",
+        "根据可配置阈值判断是否达到异常检测条件。",
+        "对明确的异常执行复位修复或下电隔离，并记录处理结果。",
+        "对反复 core 或复位的节点先排除软件异常干扰，再执行恢复、修复或隔离。",
+        "检测到异常后产生告警，并保留诊断信息。",
+        "仅对 IO 进程进行监控。"
+      ],
+      "why": "当前检测机制无法有效检测所有部件异常，可能导致关键进程反复复位、节点持续异常或数据不一致，影响系统故障发现和服务恢复。",
+      "how_much": [
+        "非明确异常每月最多处理一个节点。",
+        "提升异常检测能力。",
+        "检测到异常后必须产生告警。",
+        "检测阈值支持调整。",
+        "对系统性能无明显影响。"
+      ],
+      "constraints": [
+        "只监控 IO 进程，不扩大到其他进程。",
+        "只针对类型 A 部件。",
+        "检测属于事后检测，不能保证数据不损坏。",
+        "数据修复不属于本 IR 范围。",
+        "根据进程复位表现判断异常可能存在误判，器件故障率可能上升。",
+        "软件异常未排除前，不应直接执行节点隔离。"
+      ],
+      "performance": "对性能无明显影响。",
+      "reliability": "提升异常检测和故障隔离能力。",
+      "serviceability": "检测到异常后产生告警并保留诊断信息。",
+      "maintainability": "检测阈值支持调整。",
+      "sales": "不涉及。",
+      "delivery_time": "待项目计划确定。",
+      "tags": [
+        "DFX",
+        "IO 进程",
+        "反复 core",
+        "异常检测",
+        "故障隔离",
+        "类型 A",
+        "正常服务"
+      ],
+      "id": "IR-TEST-001",
+      "created_at": "2026-08-24T01:43:39.607918Z",
+      "updated_at": "2026-08-24T01:43:39.607918Z"
+    }
+  ],
+  "use_cases": [
+    {
+      "id": "uc_requirement_matching",
+      "name": "IR 需求与场景匹配",
+      "description": "将用户 IR 解析为结构化 5W2H/DFX 信息，并从场景库中找出可复用场景。",
+      "actor": "需求分析人员",
+      "preconditions": [
+        "IR 原文可读取"
+      ],
+      "trigger_event": "用户提交一条需要匹配的 IR",
+      "success_guarantee": "返回有依据的场景候选和复用或新增决策",
+      "minimum_guarantee": "信息不足时列出缺失字段且不执行写入",
+      "main_success_scenario": [
+        "解析 IR",
+        "检索候选场景",
+        "比较关键维度",
+        "返回匹配结论"
+      ],
+      "extension_scenarios": [
+        "低置信度时转人工确认"
+      ],
+      "constraints": [
+        "不得编造场景或 UC 编号"
+      ],
+      "dfx": [
+        "可追溯",
+        "可审计"
+      ],
+      "catalog": "需求分析",
+      "status": "active",
+      "workflow_status": "Publish",
+      "security_level": null,
+      "tags": [
+        "IR",
+        "匹配",
+        "检索"
+      ],
+      "source_ir_ids": [],
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    },
+    {
+      "id": "uc_knowledge_retrieval_qa",
+      "name": "企业知识库检索问答",
+      "description": "从企业文档、制度和 FAQ 中召回相关证据并生成带依据的回答。",
+      "actor": "企业知识用户",
+      "preconditions": [
+        "知识库已建立索引"
+      ],
+      "trigger_event": "用户提交知识问题",
+      "success_guarantee": "返回与问题相关且可追溯的回答",
+      "minimum_guarantee": "无可靠证据时明确说明未找到",
+      "main_success_scenario": [
+        "理解问题",
+        "召回证据",
+        "聚合证据",
+        "生成回答"
+      ],
+      "extension_scenarios": [
+        "多轮追问时继承上下文"
+      ],
+      "constraints": [
+        "回答必须基于召回证据"
+      ],
+      "dfx": [
+        "可追溯"
+      ],
+      "catalog": "知识检索",
+      "status": "active",
+      "workflow_status": "Publish",
+      "security_level": null,
+      "tags": [
+        "知识库",
+        "检索",
+        "问答",
+        "RAG"
+      ],
+      "source_ir_ids": [],
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    },
+    {
+      "id": "uc_multi_use_case_mapping",
+      "name": "一个需求映射多个 use case",
+      "description": "将复合 IR 拆解并关联到多个可执行 UC。",
+      "actor": "需求分析人员",
+      "preconditions": [
+        "IR 包含多个可分离目标"
+      ],
+      "trigger_event": "单个场景下出现多个独立行为链",
+      "success_guarantee": "每个行为链映射到明确 UC",
+      "minimum_guarantee": "保留无法拆分部分并标记人工确认",
+      "main_success_scenario": [
+        "识别子目标",
+        "拆分行为链",
+        "匹配 UC",
+        "建立关联"
+      ],
+      "extension_scenarios": [],
+      "constraints": [
+        "不得因拆分丢失原 IR 约束"
+      ],
+      "dfx": [
+        "可维护"
+      ],
+      "catalog": "需求分析",
+      "status": "active",
+      "workflow_status": "Publish",
+      "security_level": null,
+      "tags": [
+        "多用例",
+        "拆解",
+        "映射"
+      ],
+      "source_ir_ids": [],
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    },
+    {
+      "id": "uc_new_scenario_design",
+      "name": "新场景设计与草拟",
+      "description": "场景库缺少可复用条目时生成完整场景草稿。",
+      "actor": "场景设计人员",
+      "preconditions": [
+        "匹配结论为需要新建场景"
+      ],
+      "trigger_event": "没有场景覆盖 IR 的关键上下文和影响因素",
+      "success_guarantee": "生成通过必填校验的场景草稿",
+      "minimum_guarantee": "字段不足时只返回待补清单",
+      "main_success_scenario": [
+        "提取场景字段",
+        "校验必填项",
+        "请求审批",
+        "写入草稿"
+      ],
+      "extension_scenarios": [
+        "责任人未知时停止写入"
+      ],
+      "constraints": [
+        "描述、类别、Actor、影响因素、责任人必填"
+      ],
+      "dfx": [
+        "可维护",
+        "可审计"
+      ],
+      "catalog": "场景设计",
+      "status": "active",
+      "workflow_status": "Publish",
+      "security_level": null,
+      "tags": [
+        "新建",
+        "场景库",
+        "设计"
+      ],
+      "source_ir_ids": [],
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    },
+    {
+      "id": "uc_human_review",
+      "name": "场景评审与人工确认",
+      "description": "对低置信度匹配或新增 SC/UC 草稿进行人工确认和审批。",
+      "actor": "评审人员",
+      "preconditions": [
+        "存在低置信度结论或待写入草稿"
+      ],
+      "trigger_event": "Agent 请求人工审批",
+      "success_guarantee": "审批决定和修改内容被记录",
+      "minimum_guarantee": "拒绝审批时不修改场景库",
+      "main_success_scenario": [
+        "展示差异",
+        "评审字段",
+        "批准或拒绝",
+        "记录审计"
+      ],
+      "extension_scenarios": [],
+      "constraints": [
+        "写操作必须显式授权"
+      ],
+      "dfx": [
+        "安全",
+        "可审计"
+      ],
+      "catalog": "评审",
+      "status": "active",
+      "workflow_status": "Publish",
+      "security_level": null,
+      "tags": [
+        "评审",
+        "审批",
+        "人工确认"
+      ],
+      "source_ir_ids": [],
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    },
+    {
+      "id": "UC-XXXX-001",
+      "name": "某指令异常检测和隔离",
+      "description": "检测特定类型部件的某指令异常，并对异常节点执行恢复、复位或隔离。",
+      "actor": "本系统",
+      "preconditions": [
+        "系统正常运行",
+        "目标部件在线",
+        "IO 进程监控已启用"
+      ],
+      "trigger_event": "出现反复进程复位、校验错误或数据不一致等异常表现",
+      "success_guarantee": "明确异常节点被修复或下电隔离，并产生告警",
+      "minimum_guarantee": "未能确认异常时保留告警和诊断信息，不执行数据修复",
+      "main_success_scenario": [
+        "采集目标部件异常表现",
+        "判断是否为明确异常",
+        "明确异常时执行复位修复或下电隔离",
+        "记录结果并产生告警"
+      ],
+      "extension_scenarios": [
+        "反复复位时先排除软件异常，再修复或恢复节点",
+        "疑似误判时转人工确认"
+      ],
+      "constraints": [
+        "只监控 IO 进程",
+        "只针对类型A部件",
+        "事后检测不能保证数据不损坏"
+      ],
+      "dfx": [
+        "可靠性提升",
+        "检测告警",
+        "阈值可调",
+        "性能无影响"
+      ],
+      "catalog": "正常服务/异常检测",
+      "status": "working",
+      "workflow_status": "Inwork",
+      "security_level": "机密",
+      "tags": [
+        "指令异常",
+        "检测",
+        "隔离",
+        "类型A"
+      ],
+      "source_ir_ids": [
+        "IR-XXXX-001"
+      ],
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    },
+    {
+      "id": "UC-XXXX-002",
+      "name": "单节点 IO 进程反复 core 的检测和隔离",
+      "description": "检测单节点 IO 进程反复 core，在排除软件异常后恢复、修复或隔离节点。",
+      "actor": "本系统",
+      "preconditions": [
+        "系统正常运行",
+        "IO 进程监控已启用"
+      ],
+      "trigger_event": "单节点 IO 进程在阈值窗口内反复 core 或复位",
+      "success_guarantee": "确认的异常节点被恢复、修复或隔离并产生告警",
+      "minimum_guarantee": "无法排除软件干扰时不误隔离节点，并保留诊断信息",
+      "main_success_scenario": [
+        "统计单节点 IO 进程 core 或复位次数",
+        "达到阈值后排除软件异常干扰",
+        "确认硬件异常后恢复、修复或隔离节点",
+        "产生告警并记录处理结果"
+      ],
+      "extension_scenarios": [
+        "未排除软件异常时延迟处理",
+        "当月已处理一个非明确异常节点时仅告警"
+      ],
+      "constraints": [
+        "不限制部件类型",
+        "非明确异常每月只处理一个节点"
+      ],
+      "dfx": [
+        "可靠性提升",
+        "可服务性告警",
+        "阈值可维护"
+      ],
+      "catalog": "正常服务/进程异常",
+      "status": "working",
+      "workflow_status": "Inwork",
+      "security_level": "机密",
+      "tags": [
+        "IO进程",
+        "反复core",
+        "检测",
+        "隔离"
+      ],
+      "source_ir_ids": [
+        "IR-XXXX-001"
+      ],
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z"
+    },
+    {
+      "id": "UC-DRAFT-2FBCC6C2",
+      "name": "改进单节点IO进程反复core或复位的异常检测与隔离",
+      "description": "系统正常运行时，类型 A 部件可能出现异常，导致单节点 IO 进程反复 core 或复位，也可能出现校验错误和数据不一致。本用例根据故障表现识别异常，并在确认后对节点执行复位修复、恢复或下电隔离，同时产生告警并保留诊断信息。",
+      "actor": "本系统",
+      "preconditions": [
+        "系统正常运行",
+        "类型 A 部件及其所在节点在线",
+        "IO 进程监控已启用",
+        "异常检测阈值已配置"
+      ],
+      "trigger_event": "单节点 IO 进程在观察窗口内反复 core 或复位，或出现校验错误和数据不一致等异常表现",
+      "success_guarantee": "明确的异常节点被复位修复或下电隔离；反复 core 或复位的节点在排除软件异常干扰后被恢复、修复或隔离，并产生告警且保留诊断信息",
+      "minimum_guarantee": "无法确认异常或软件异常未排除时不直接隔离节点，保留告警和诊断信息，不执行数据修复",
+      "main_success_scenario": [
+        "采集单节点 IO 进程的 core、复位、校验错误和数据不一致等故障表现",
+        "根据可配置阈值判断是否达到异常检测条件",
+        "对明确的异常执行复位修复或下电隔离，并记录处理结果",
+        "对反复 core 或复位的节点先排除软件异常干扰，再执行恢复、修复或隔离",
+        "检测到异常后产生告警，并保留诊断信息"
+      ],
+      "extension_scenarios": [
+        "软件异常未排除前，不直接执行节点隔离，仅记录并等待确认",
+        "当月已处理一个非明确异常节点时，仅产生告警不重复处理",
+        "疑似误判时转人工确认",
+        "检测阈值调整后重新评估异常条件"
+      ],
+      "constraints": [
+        "只监控 IO 进程，不扩大到其他进程",
+        "只针对类型 A 部件",
+        "检测属于事后检测，不能保证数据不损坏",
+        "数据修复不属于本 IR 范围",
+        "根据进程复位表现判断异常可能存在误判，器件故障率可能上升"
+      ],
+      "dfx": [
+        "性能：对性能无明显影响",
+        "可靠性：提升异常检测和故障隔离能力",
+        "可服务性：检测到异常后产生告警并保留诊断信息",
+        "可维护性：检测阈值支持调整"
+      ],
+      "catalog": "正常服务/进程异常",
+      "status": "draft",
+      "workflow_status": "Draft",
+      "security_level": "机密",
+      "tags": [
+        "DFX",
+        "IO 进程",
+        "反复 core",
+        "异常检测",
+        "故障隔离",
+        "类型 A",
+        "正常服务"
+      ],
+      "source_ir_ids": [
+        "IR-TEST-001"
+      ],
+      "created_at": "2026-08-24T01:43:40.323981Z",
+      "updated_at": "2026-08-24T01:43:40.323981Z"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "scn_enterprise_knowledge_qa",
+      "name": "企业知识库多轮检索问答",
+      "description": "用户围绕企业制度、产品文档和 FAQ 进行多轮提问，系统结合上下文检索证据并给出可追溯回答。",
+      "category": "业务场景",
+      "actor": "企业知识用户",
+      "influence_factors": [
+        {
+          "name": "知识来源",
+          "kind": "activity",
+          "dimension": "business_scenario",
+          "candidate_values": [
+            "制度",
+            "产品文档",
+            "FAQ"
+          ],
+          "selected_values": [
+            "企业知识库"
+          ]
+        }
+      ],
+      "owner": "demo",
+      "business_goal": "提升企业知识查询效率和回答可信度",
+      "actions": [
+        "理解问题",
+        "检索证据",
+        "生成可追溯回答"
+      ],
+      "constraints": [
+        "回答必须基于知识库证据"
+      ],
+      "dfx": [],
+      "affected_components": [
+        "知识库",
+        "检索服务"
+      ],
+      "lifecycle": "正常服务",
+      "tags": [
+        "IR",
+        "知识库",
+        "检索",
+        "问答",
+        "RAG"
+      ],
+      "use_case_ids": [
+        "uc_knowledge_retrieval_qa"
+      ],
+      "source_ir_ids": [],
+      "status": "active",
+      "workflow_status": "Publish",
+      "security_level": null,
+      "esn_id": null,
+      "topology_diagram": null,
+      "ir_intent": "从企业知识库召回相关内容，支持多轮上下文和证据引用。",
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z",
+      "metadata": {
+        "source": "seed"
+      }
+    },
+    {
+      "id": "scn_customer_feedback_classification",
+      "name": "客户反馈分类与路由",
+      "description": "从客服对话和用户反馈中识别主题、意图和紧急程度，并路由到相应团队或处理流程。",
+      "category": "业务场景",
+      "actor": "客服人员",
+      "influence_factors": [
+        {
+          "name": "反馈渠道",
+          "kind": "activity",
+          "dimension": "business_scenario",
+          "candidate_values": [
+            "对话",
+            "工单",
+            "问卷"
+          ],
+          "selected_values": [
+            "多渠道"
+          ]
+        }
+      ],
+      "owner": "demo",
+      "business_goal": "自动识别并分发客户反馈",
+      "actions": [
+        "识别意图",
+        "分类",
+        "路由"
+      ],
+      "constraints": [
+        "低置信度反馈需人工确认"
+      ],
+      "dfx": [],
+      "affected_components": [
+        "客服系统"
+      ],
+      "lifecycle": "正常服务",
+      "tags": [
+        "客服",
+        "反馈",
+        "分类",
+        "路由",
+        "NLP"
+      ],
+      "use_case_ids": [],
+      "source_ir_ids": [],
+      "status": "active",
+      "workflow_status": "Publish",
+      "security_level": null,
+      "esn_id": null,
+      "topology_diagram": null,
+      "ir_intent": "对非结构化用户反馈进行意图识别、分类和后续路由。",
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z",
+      "metadata": {
+        "source": "seed"
+      }
+    },
+    {
+      "id": "scn_multi_hop_evidence_retrieval",
+      "name": "多跳证据检索与聚合",
+      "description": "对跨文档、跨实体或跨时间范围的 IR 需求分别召回证据，再合并成可审计证据链。",
+      "category": "技术场景",
+      "actor": "知识分析人员",
+      "influence_factors": [
+        {
+          "name": "检索跨度",
+          "kind": "activity",
+          "dimension": "business_scenario",
+          "candidate_values": [
+            "跨文档",
+            "跨实体",
+            "跨时间"
+          ],
+          "selected_values": [
+            "多跳"
+          ]
+        }
+      ],
+      "owner": "demo",
+      "business_goal": "支持复杂问题的证据检索和审计",
+      "actions": [
+        "分步召回",
+        "证据聚合",
+        "生成证据链"
+      ],
+      "constraints": [
+        "保留中间证据"
+      ],
+      "dfx": [],
+      "affected_components": [
+        "检索服务",
+        "证据存储"
+      ],
+      "lifecycle": "正常服务",
+      "tags": [
+        "多跳",
+        "证据",
+        "检索",
+        "聚合",
+        "审计"
+      ],
+      "use_case_ids": [],
+      "source_ir_ids": [],
+      "status": "draft",
+      "workflow_status": "Draft",
+      "security_level": null,
+      "esn_id": null,
+      "topology_diagram": null,
+      "ir_intent": "通过多步检索和证据聚合回答复杂问题，并保留中间依据。",
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z",
+      "metadata": {
+        "source": "seed"
+      }
+    },
+    {
+      "id": "scn_requirement_analysis",
+      "name": "IR 需求分析与场景设计",
+      "description": "需求分析人员对 IR 进行结构化提取、场景匹配、场景草拟和人工评审，形成可追溯的 SC 与 UC。",
+      "category": "Scenario",
+      "actor": "需求分析人员",
+      "influence_factors": [
+        {
+          "name": "需求输入",
+          "kind": "activity",
+          "dimension": "business_scenario",
+          "candidate_values": [
+            "IR",
+            "需求文档",
+            "场景库"
+          ],
+          "selected_values": [
+            "需求分析"
+          ]
+        }
+      ],
+      "owner": "demo",
+      "business_goal": "完成需求到场景和用例的可追溯分析",
+      "actions": [
+        "解析 IR",
+        "匹配场景",
+        "派生 UC 草稿",
+        "人工评审"
+      ],
+      "constraints": [
+        "不得把 IR 原文直接作为场景",
+        "写入前必须完成审批"
+      ],
+      "dfx": [
+        "可追溯",
+        "可审计"
+      ],
+      "affected_components": [
+        "需求分析服务",
+        "场景库"
+      ],
+      "lifecycle": "需求分析",
+      "tags": [
+        "IR",
+        "场景分析",
+        "UC",
+        "评审"
+      ],
+      "use_case_ids": [
+        "uc_requirement_matching",
+        "uc_multi_use_case_mapping",
+        "uc_new_scenario_design",
+        "uc_human_review"
+      ],
+      "source_ir_ids": [],
+      "status": "active",
+      "workflow_status": "Publish",
+      "security_level": null,
+      "esn_id": null,
+      "topology_diagram": null,
+      "ir_intent": "将 IR 规范化、匹配或新建 SC，并在同一父场景下维护 UC。",
+      "created_at": "2026-08-24T00:00:00Z",
+      "updated_at": "2026-08-24T00:00:00Z",
+      "metadata": {
+        "source": "seed",
+        "relationship": "SC_1_to_N_UC"
+      }
+    },
+    {
+      "id": "SCN-XXXX-001",
+      "name": "【正常服务】某指令异常检测和隔离",
+      "description": "系统正常运行时，检测类型A部件上的某指令异常，并对明确异常节点执行复位修复或下电隔离。",
+      "category": "派生场景",
+      "actor": "本系统",
+      "influence_factors": [
+        {
+          "name": "部件类型",
+          "kind": "environment",
+          "dimension": "hardware_environment",
+          "candidate_values": [
+            "类型A",
+            "类型B"
+          ],
+          "selected_values": [
+            "类型A"
+          ]
+        }
+      ],
+      "owner": "脱敏责任人",
+      "business_goal": "检测某指令异常并隔离节点",
+      "actions": [
+        "检测异常表现",
+        "判断异常类型",
+        "修复、恢复或隔离节点",
+        "产生告警"
+      ],
+      "constraints": [
+        "只针对类型A部件",
+        "只监控 IO 进程",
+        "检测为事后检测"
+      ],
+      "dfx": [
+        "性能：对性能无影响",
+        "可靠性：检测能力提升",
+        "可服务性：检测到异常后产生告警",
+        "可维护性：检测阈值可以调整"
+      ],
+      "affected_components": [
+        "某部件",
+        "IO进程"
+      ],
+      "lifecycle": "正常服务",
+      "tags": [
+        "指令异常",
+        "异常检测",
+        "故障隔离",
+        "类型A"
+      ],
+      "use_case_ids": [
+        "UC-XXXX-001",
+        "UC-DRAFT-2FBCC6C2"
+      ],
+      "source_ir_ids": [
+        "IR-XXXX-001"
+      ],
+      "status": "published",
+      "workflow_status": "Publish",
+      "security_level": "机密",
+      "esn_id": null,
+      "topology_diagram": null,
+      "ir_intent": "根据故障表现检测异常并修复或隔离节点。",
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-24T01:43:40.323981Z",
+      "metadata": {
+        "source": "sanitized-example",
+        "topology_status": "missing"
+      }
+    },
+    {
+      "id": "SCN-XXXX-002",
+      "name": "【正常服务】某核指令异常检测和隔离",
+      "description": "系统正常运行时，不限制部件类型地检测某指令异常，并恢复、修复或隔离异常节点。",
+      "category": "派生场景",
+      "actor": "本系统",
+      "influence_factors": [
+        {
+          "name": "部件类型",
+          "kind": "environment",
+          "dimension": "hardware_environment",
+          "candidate_values": [
+            "类型A",
+            "类型B"
+          ],
+          "selected_values": [
+            "不限"
+          ]
+        }
+      ],
+      "owner": "脱敏责任人",
+      "business_goal": "检测和隔离某指令异常节点",
+      "actions": [
+        "监控 IO 进程",
+        "识别反复 core 或复位",
+        "排除软件干扰",
+        "恢复、修复或隔离节点"
+      ],
+      "constraints": [
+        "不限制部件类型",
+        "非明确异常每月只处理一个节点"
+      ],
+      "dfx": [
+        "性能：对性能无影响",
+        "可靠性：检测能力提升",
+        "可服务性：检测到异常后产生告警",
+        "可维护性：检测阈值可以调整"
+      ],
+      "affected_components": [
+        "某部件",
+        "IO进程"
+      ],
+      "lifecycle": "正常服务",
+      "tags": [
+        "指令异常",
+        "IO进程",
+        "反复core",
+        "故障隔离"
+      ],
+      "use_case_ids": [
+        "UC-XXXX-002"
+      ],
+      "source_ir_ids": [
+        "IR-XXXX-001"
+      ],
+      "status": "published",
+      "workflow_status": "Publish",
+      "security_level": "机密",
+      "esn_id": null,
+      "topology_diagram": null,
+      "ir_intent": "检测单节点 IO 进程反复 core，在排除软件干扰后恢复或隔离节点。",
+      "created_at": "2026-08-21T00:00:00Z",
+      "updated_at": "2026-08-21T00:00:00Z",
+      "metadata": {
+        "source": "sanitized-example",
+        "topology_status": "missing"
+      }
+    }
+  ]
+}
