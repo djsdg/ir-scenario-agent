@@ -24,10 +24,11 @@ from .agent import (
 from .audit import AuditLogger
 from .config import Settings
 from .documents import read_document
-from .library import ScenarioLibrary
+from .library import ScenarioLibrary, open_scenario_library
 from .mcp import MCPConfig
 from .memory import MemoryStore
 from .plugins import PluginContext, PluginLoadReport, PluginManager
+from .retrieval import OpenAIEmbeddingProvider
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
 from .tools import ToolRegistry
@@ -310,6 +311,22 @@ if _TEXTUAL_IMPORT_ERROR is None:
             margin: 0 1;
             scrollbar-size: 1 1;
         }
+        #candidate-actions {
+            height: 3;
+            align: right middle;
+            margin: 0 1;
+        }
+        #candidate-actions Button {
+            margin-left: 1;
+        }
+        #selection-summary {
+            height: auto;
+            min-height: 2;
+            max-height: 5;
+            margin: 0 1;
+            border: round $secondary;
+            padding: 0 1;
+        }
         #candidates, #tools {
             height: 1fr;
             padding: 0 1;
@@ -412,6 +429,10 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self._last_output_path: Path | None = None
             self._busy = False
             self._path_loading = False
+            self._current_scenario_id: str | None = None
+            self._current_use_case_id: str | None = None
+            self._selected_scenario_ids: list[str] = []
+            self._selected_use_case_ids: list[str] = []
 
             if runtime is not None:
                 self.set_runtime(runtime)
@@ -486,6 +507,13 @@ if _TEXTUAL_IMPORT_ERROR is None:
                                 yield DataTable(id="candidate-table", cursor_type="row")
                                 yield Static("UC 候选（按父 SC 过滤）", classes="comparison-title")
                                 yield DataTable(id="use-case-table", cursor_type="row")
+                                yield Static("尚未选择候选。点击表格行后加入选择。", id="selection-summary")
+                                with Horizontal(id="candidate-actions"):
+                                    yield Button("加入当前选择", id="add-selection", variant="primary")
+                                    yield Button("填充确认/编辑提示", id="prepare-selection")
+                                    yield Button("确认选择并发送", id="confirm-selection", variant="success")
+                                    yield Button("检查库质量", id="validate-library")
+                                    yield Button("清空选择", id="clear-selection")
                                 yield RichLog(id="candidates", wrap=True, markup=False)
                             with TabPane("工具日志", id="tools-tab"):
                                 yield RichLog(id="tools", wrap=True, markup=False)
@@ -520,6 +548,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 f"记忆：{'开启' if self.agent.memory is not None else '关闭'}",
                 f"远程 MCP：{'开启' if mcp_enabled else '关闭'}",
                 f"插件：{len(self.runtime.plugin_report.loaded)} 个",
+                f"Embedding：{self.settings.embedding_model or '关闭（关键词 + TF-IDF）'}",
             ]
             matching_rules = getattr(getattr(self.agent, "spec", None), "matching_rules", {})
             if isinstance(matching_rules, dict):
@@ -586,6 +615,16 @@ if _TEXTUAL_IMPORT_ERROR is None:
             elif button_id == "clear-input":
                 self.query_one("#prompt", TextArea).clear()
                 self._set_input_meta("输入区已清空。")
+            elif button_id == "add-selection":
+                self._add_current_selection()
+            elif button_id == "prepare-selection":
+                self._prepare_selection_prompt(auto_submit=False)
+            elif button_id == "confirm-selection":
+                self._prepare_selection_prompt(auto_submit=True)
+            elif button_id == "validate-library":
+                self._validate_library_direct()
+            elif button_id == "clear-selection":
+                self._clear_selection()
             elif button_id == "open-output":
                 self._open_result_path(
                     self._last_output_path.parent
@@ -610,6 +649,126 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self._last_output_path = None
             self.query_one("#open-output", Button).disabled = True
             self.query_one("#open-result", Button).disabled = True
+            self._clear_selection()
+
+        def on_data_table_row_selected(self, event: Any) -> None:
+            self._remember_table_row(event)
+
+        def on_data_table_row_highlighted(self, event: Any) -> None:
+            self._remember_table_row(event)
+
+        def _remember_table_row(self, event: Any) -> None:
+            row_key = getattr(event, "row_key", None)
+            value = getattr(row_key, "value", row_key)
+            if value is None:
+                return
+            identifier = str(value)
+            table_id = getattr(getattr(event, "data_table", None), "id", None)
+            if table_id == "candidate-table":
+                self._current_scenario_id = identifier
+            elif table_id == "use-case-table":
+                self._current_use_case_id = identifier
+            else:
+                return
+            self._refresh_selection_summary()
+
+        def _add_current_selection(self) -> None:
+            if self._current_scenario_id:
+                if self._current_scenario_id not in self._selected_scenario_ids:
+                    self._selected_scenario_ids.append(self._current_scenario_id)
+                self.notify(f"已加入 SC：{self._current_scenario_id}", severity="information")
+            elif self._current_use_case_id:
+                if self._current_use_case_id not in self._selected_use_case_ids:
+                    self._selected_use_case_ids.append(self._current_use_case_id)
+                self.notify(f"已加入 UC：{self._current_use_case_id}", severity="information")
+            else:
+                self.notify("请先点击 SC 或 UC 表格中的一行。", severity="warning")
+                return
+            self._refresh_selection_summary()
+
+        def _clear_selection(self) -> None:
+            self._current_scenario_id = None
+            self._current_use_case_id = None
+            self._selected_scenario_ids.clear()
+            self._selected_use_case_ids.clear()
+            if self.is_mounted:
+                self._refresh_selection_summary()
+
+        def _refresh_selection_summary(self) -> None:
+            if not self.is_mounted:
+                return
+            selected_sc = "、".join(self._selected_scenario_ids) or "无"
+            selected_uc = "、".join(self._selected_use_case_ids) or "无"
+            current = self._current_scenario_id or self._current_use_case_id or "无"
+            self.query_one("#selection-summary", Static).update(
+                f"当前行：{current}\n已选 SC：{selected_sc}\n已选 UC：{selected_uc}"
+            )
+
+        def _prepare_selection_prompt(self, *, auto_submit: bool) -> None:
+            if not self._selected_scenario_ids and not self._selected_use_case_ids:
+                self.notify("请先加入至少一个 SC 或 UC。", severity="warning")
+                return
+            scenario_text = "、".join(self._selected_scenario_ids) or "无"
+            use_case_text = "、".join(self._selected_use_case_ids) or "无"
+            prompt = (
+                "我已在 TUI 中人工选择以下候选，请以这些编号为准继续处理。\n"
+                f"选定 SC：{scenario_text}\n"
+                f"选定 UC：{use_case_text}\n"
+                "请先读取并核对当前记录；如需补齐或修改，请先生成草稿/修改建议。"
+                "只有我明确确认写入时才调用写入工具，并保留审批流程。"
+            )
+            self.query_one("#prompt", TextArea).text = prompt
+            self._set_input_meta("已填充人工选择提示，可继续编辑后发送。")
+            if auto_submit:
+                self._submit(prompt, source="TUI 人工确认")
+
+        def _validate_library_direct(self) -> None:
+            if self._busy or self._path_loading:
+                self.notify("上一条请求还在处理中，请稍候。", severity="warning")
+                return
+            if self.agent is None:
+                self.notify("Agent 运行时未初始化。", severity="error")
+                return
+            self._busy = True
+            self._set_submit_buttons(True)
+            self._set_status("检查场景库…")
+            self._run_library_validation()
+
+        @work(thread=True, exclusive=True)
+        def _run_library_validation(self) -> None:
+            if self.agent is None:
+                self.call_from_thread(self._finish_error, "Agent 运行时未初始化")
+                return
+            try:
+                report = self.agent.tools.execute("validate_library", {})
+            except Exception as exc:
+                self.call_from_thread(self._finish_error, f"场景库检查失败：{exc}")
+            else:
+                self.call_from_thread(self._finish_library_validation, report)
+
+        def _finish_library_validation(self, report: dict[str, Any]) -> None:
+            self._busy = False
+            self._set_submit_buttons(False)
+            self._set_status("就绪")
+            counts = report.get("counts", {}) if isinstance(report, dict) else {}
+            issues = report.get("issues", []) if isinstance(report, dict) else []
+            warnings = report.get("warnings", []) if isinstance(report, dict) else []
+            ok = bool(report.get("ok")) if isinstance(report, dict) else False
+            summary = [
+                f"库质量：{'通过' if ok else '存在问题'}",
+                f"IR：{counts.get('requirements', 0)}  SC：{counts.get('scenarios', 0)}  UC：{counts.get('use_cases', 0)}",
+                f"问题：{counts.get('issues', len(issues))}  警告：{counts.get('warnings', len(warnings))}",
+            ]
+            self.query_one("#result-summary", Static).update("\n".join(summary))
+            self.conversation.write("库质量审计：\n" + "\n".join(summary))
+            self.tools_log.write(
+                f"✓ validate_library（问题 {len(issues)}，警告 {len(warnings)}）"
+            )
+            for item in [*issues, *warnings]:
+                if isinstance(item, dict):
+                    self.candidates_log.write(
+                        f"{item.get('kind', 'unknown')} | {item.get('record_id', '-')} | {item.get('message', '')}"
+                    )
 
         def open_approval(
             self,
@@ -670,7 +829,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 ir_text = read_document(ir_path).strip()
                 if not ir_text:
                     raise ValueError("IR 文档为空")
-                library = ScenarioLibrary(library_path)
+                library = open_scenario_library(library_path)
                 library.document()
             except Exception as exc:  # User-provided document/library boundary.
                 self.call_from_thread(self._finish_path_load_error, f"路径加载失败：{exc}")
@@ -733,7 +892,17 @@ if _TEXTUAL_IMPORT_ERROR is None:
             if self.agent is None or self.settings is None or self.runtime is None:
                 raise RuntimeError("Agent 运行时未初始化")
 
-            library = library or ScenarioLibrary(path)
+            library = library or open_scenario_library(path)
+            if self.settings.embedding_model:
+                library.configure_embedding(
+                    OpenAIEmbeddingProvider(
+                        api_key=self.settings.api_key,
+                        model=self.settings.embedding_model,
+                        base_url=self.settings.base_url,
+                        organization=self.settings.organization,
+                        timeout=self.settings.request_timeout,
+                    )
+                )
             # Validate both the scenario file and, for directory-based
             # libraries, the derived UC file before switching the agent.
             library.document()
@@ -949,6 +1118,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         self._clip("、".join(candidate.matched_dimensions) or "-"),
                         self._clip("；".join(candidate.gaps) or "-"),
                         self._clip("；".join(conflicts) or "-"),
+                        key=candidate.scenario_id,
                     )
                     self.candidates_log.write(
                         f"{index}. {candidate.scenario_id} | 分数 {candidate.score:.2f}"
@@ -1039,6 +1209,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     score,
                     parent_id,
                     matched_terms,
+                    key=use_case_id,
                 )
 
         def _match_candidate_details(self, result: Any) -> dict[str, dict[str, Any]]:
@@ -1166,10 +1337,20 @@ def _build_runtime(args: argparse.Namespace, app: Any) -> _Runtime:
     if args.no_structured_output:
         settings = replace(settings, structured_output=False)
 
-    library = ScenarioLibrary(
+    library = open_scenario_library(
         settings.library_path,
         use_case_path=settings.uc_library_path,
     )
+    if settings.embedding_model:
+        library.configure_embedding(
+            OpenAIEmbeddingProvider(
+                api_key=settings.api_key,
+                model=settings.embedding_model,
+                base_url=settings.base_url,
+                organization=settings.organization,
+                timeout=settings.request_timeout,
+            )
+        )
     try:
         spec = SpecCatalog.from_file(settings.spec_path)
     except SpecError:

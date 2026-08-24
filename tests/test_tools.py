@@ -38,6 +38,11 @@ class ToolRegistryTests(unittest.TestCase):
                 "match_use_case",
                 "search_use_cases",
                 "get_use_case",
+                "update_scenario",
+                "update_use_case",
+                "transition_record",
+                "move_use_case",
+                "validate_library",
                 "list_use_cases",
                 "create_scenario",
                 "create_use_case",
@@ -164,6 +169,36 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(result["decision"], "reuse_existing")
         self.assertEqual(result["matches"][0]["use_case"]["id"], "uc_knowledge_retrieval_qa")
         self.assertEqual(result["scenario_id"], "scn_enterprise_knowledge_qa")
+
+    def test_validate_library_reports_a_clean_seed_library(self) -> None:
+        result = self.registry.execute("validate_library", {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["counts"]["issues"], 0)
+        self.assertGreater(result["counts"]["scenarios"], 0)
+
+    def test_update_and_transition_tools_keep_lifecycle_explicit(self) -> None:
+        updated = self.registry.execute(
+            "update_scenario",
+            {
+                "scenario_id": "scn_multi_hop_evidence_retrieval",
+                "description": "补充证据检索场景的行为边界和质量要求。",
+            },
+        )
+        self.assertTrue(updated["ok"])
+        self.assertEqual(updated["scenario"]["revision"], 2)
+
+        transitioned = self.registry.execute(
+            "transition_record",
+            {
+                "record_type": "scenario",
+                "record_id": "scn_multi_hop_evidence_retrieval",
+                "workflow_status": "Inwork",
+                "comment": "进入人工细化阶段",
+            },
+        )
+        self.assertTrue(transitioned["ok"])
+        self.assertEqual(transitioned["record"]["workflow_status"], "Inwork")
 
     def test_use_case_match_rejects_unknown_scenario_scope(self) -> None:
         result = self.registry.execute(

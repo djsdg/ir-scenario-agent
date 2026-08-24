@@ -10,6 +10,10 @@ from .domain import (
     CreateUseCaseRequest,
     IRRequirementInput,
     LinkUseCasesRequest,
+    MoveUseCaseRequest,
+    TransitionRecordRequest,
+    UpdateScenarioRequest,
+    UpdateUseCaseRequest,
 )
 from .library import ScenarioLibrary
 from .memory import MemoryStore
@@ -117,6 +121,10 @@ def _string_array(*, min_items: int = 0, max_items: int = 100) -> dict[str, Any]
         "maxItems": max_items,
         "items": {"type": "string"},
     }
+
+
+def _nullable_array(schema: dict[str, Any]) -> dict[str, Any]:
+    return {"anyOf": [schema, {"type": "null"}]}
 
 
 def _ir_schema() -> dict[str, Any]:
@@ -312,6 +320,100 @@ def _link_parameters() -> dict[str, Any]:
             "use_case_ids": _string_array(min_items=1, max_items=50),
         },
         "required": ["scenario_id", "use_case_ids"],
+    }
+
+
+def _update_scenario_parameters() -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "scenario_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "name": _nullable_string(max_length=300),
+        "description": _nullable_string(max_length=8_000),
+        "category": _nullable_string(max_length=200),
+        "actor": _nullable_string(max_length=1_000),
+        "influence_factors": _nullable_array(
+            {
+                "type": "array",
+                "maxItems": 100,
+                "items": _influence_factor_schema(),
+            }
+        ),
+        "owner": _nullable_string(max_length=300),
+        "business_goal": _nullable_string(max_length=4_000),
+        "actions": _nullable_array(_string_array(max_items=100)),
+        "constraints": _nullable_array(_string_array(max_items=100)),
+        "dfx": _nullable_array(_string_array(max_items=100)),
+        "affected_components": _nullable_array(_string_array(max_items=100)),
+        "lifecycle": _nullable_string(max_length=500),
+        "tags": _nullable_array(_string_array(max_items=50)),
+        "source_ir_ids": _nullable_array(_string_array(max_items=50)),
+        "security_level": _nullable_string(max_length=100),
+        "esn_id": _nullable_string(max_length=120),
+        "topology_diagram": _nullable_string(max_length=2_000),
+        "ir_intent": _nullable_string(max_length=4_000),
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
+    }
+
+
+def _update_use_case_parameters() -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "use_case_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "name": _nullable_string(max_length=300),
+        "description": _nullable_string(max_length=8_000),
+        "actor": _nullable_string(max_length=1_000),
+        "preconditions": _nullable_array(_string_array(max_items=100)),
+        "trigger_event": _nullable_string(max_length=4_000),
+        "success_guarantee": _nullable_string(max_length=4_000),
+        "minimum_guarantee": _nullable_string(max_length=4_000),
+        "main_success_scenario": _nullable_array(_string_array(max_items=100)),
+        "extension_scenarios": _nullable_array(_string_array(max_items=100)),
+        "constraints": _nullable_array(_string_array(max_items=100)),
+        "dfx": _nullable_array(_string_array(max_items=100)),
+        "catalog": _nullable_string(max_length=1_000),
+        "tags": _nullable_array(_string_array(max_items=50)),
+        "source_ir_ids": _nullable_array(_string_array(max_items=50)),
+        "security_level": _nullable_string(max_length=100),
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
+    }
+
+
+def _transition_parameters() -> dict[str, Any]:
+    properties = {
+        "record_type": {"type": "string", "enum": ["scenario", "use_case"]},
+        "record_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "workflow_status": {
+            "type": "string",
+            "enum": ["Draft", "Inwork", "Review", "Publish", "Obsolete"],
+        },
+        "comment": _nullable_string(max_length=2_000),
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
+    }
+
+
+def _move_use_case_parameters() -> dict[str, Any]:
+    properties = {
+        "use_case_id": {"type": "string", "minLength": 1, "maxLength": 120},
+        "target_scenario_id": {"type": "string", "minLength": 1, "maxLength": 120},
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
     }
 
 
@@ -568,6 +670,73 @@ class ToolRegistry:
                     "use_case": self.library.get_use_case(args.use_case_id).model_dump(mode="json")
                 },
             ),
+            "update_scenario": ToolSpec(
+                name="update_scenario",
+                description=(
+                    "Update the content fields of one existing SC after human confirmation. "
+                    "Workflow status changes must use transition_record; obsolete SCs cannot be edited."
+                ),
+                parameters=_update_scenario_parameters(),
+                input_model=UpdateScenarioRequest,
+                requires_approval=True,
+                handler=lambda args: {
+                    "updated": True,
+                    "scenario": self._update_scenario(args),
+                },
+            ),
+            "update_use_case": ToolSpec(
+                name="update_use_case",
+                description=(
+                    "Update the content fields of one existing UC after human confirmation. "
+                    "Use move_use_case for changing its parent SC."
+                ),
+                parameters=_update_use_case_parameters(),
+                input_model=UpdateUseCaseRequest,
+                requires_approval=True,
+                handler=lambda args: {
+                    "updated": True,
+                    "use_case": self._update_use_case(args),
+                },
+            ),
+            "transition_record": ToolSpec(
+                name="transition_record",
+                description=(
+                    "Move one SC or UC through Draft/Inwork/Review/Publish/Obsolete with "
+                    "validated workflow transitions. Obsolete is terminal."
+                ),
+                parameters=_transition_parameters(),
+                input_model=TransitionRecordRequest,
+                requires_approval=True,
+                handler=lambda args: {
+                    "updated": True,
+                    "record": self._transition_record(args),
+                },
+            ),
+            "move_use_case": ToolSpec(
+                name="move_use_case",
+                description=(
+                    "Move one UC to another parent SC while preserving the exactly-one-parent rule. "
+                    "This changes both scenario links and the UC revision."
+                ),
+                parameters=_move_use_case_parameters(),
+                input_model=MoveUseCaseRequest,
+                requires_approval=True,
+                handler=lambda args: {
+                    "updated": True,
+                    "use_case": self._move_use_case(args),
+                    "target_scenario_id": args.target_scenario_id,
+                },
+            ),
+            "validate_library": ToolSpec(
+                name="validate_library",
+                description=(
+                    "Read-only quality audit for the active IR/SC/UC library: checks Spec required fields, "
+                    "SC-to-UC parent references, duplicate IDs, orphan UC records, and unresolved IR traces."
+                ),
+                parameters=_list_parameters(),
+                input_model=None,
+                handler=lambda _args: self._validate_library(),
+            ),
             "list_use_cases": ToolSpec(
                 name="list_use_cases",
                 description="List use cases currently available in the library.",
@@ -637,6 +806,62 @@ class ToolRegistry:
         if gaps:
             raise ValueError(f"UC 不符合当前 Spec，待补字段：{', '.join(gaps)}")
         return self.library.create_use_case(args).model_dump(mode="json")
+
+    def _update_scenario(self, args: UpdateScenarioRequest) -> dict[str, Any]:
+        current = self.library.get_scenario(args.scenario_id)
+        payload = current.model_dump(mode="json")
+        payload.update(args.model_dump(exclude={"scenario_id"}, exclude_unset=True))
+        gaps = self.spec.validate_scenario_payload(payload)
+        if gaps:
+            raise ValueError(f"SC 不符合当前 Spec，待补字段：{', '.join(gaps)}")
+        return self.library.update_scenario(args).model_dump(mode="json")
+
+    def _update_use_case(self, args: UpdateUseCaseRequest) -> dict[str, Any]:
+        current = self.library.get_use_case(args.use_case_id)
+        payload = current.model_dump(mode="json")
+        payload.update(args.model_dump(exclude={"use_case_id"}, exclude_unset=True))
+        gaps = self.spec.validate_use_case_payload(payload)
+        if gaps:
+            raise ValueError(f"UC 不符合当前 Spec，待补字段：{', '.join(gaps)}")
+        return self.library.update_use_case(args).model_dump(mode="json")
+
+    def _transition_record(self, args: TransitionRecordRequest) -> dict[str, Any]:
+        return self.library.transition_record(args).model_dump(mode="json")
+
+    def _move_use_case(self, args: MoveUseCaseRequest) -> dict[str, Any]:
+        return self.library.move_use_case(args).model_dump(mode="json")
+
+    def _validate_library(self) -> dict[str, Any]:
+        report = self.library.quality_report()
+        issues = list(report.get("issues", []))
+        counts = dict(report.get("counts", {}))
+        for scenario in self.library.list_scenarios():
+            gaps = self.spec.validate_scenario_payload(scenario.model_dump(mode="json"))
+            if gaps:
+                issues.append(
+                    {
+                        "kind": "scenario_spec_fields",
+                        "record_id": scenario.id,
+                        "message": "SC 不符合当前 Spec：" + "、".join(gaps),
+                    }
+                )
+        for use_case in self.library.list_use_cases():
+            gaps = self.spec.validate_use_case_payload(use_case.model_dump(mode="json"))
+            if gaps:
+                issues.append(
+                    {
+                        "kind": "use_case_spec_fields",
+                        "record_id": use_case.id,
+                        "message": "UC 不符合当前 Spec：" + "、".join(gaps),
+                    }
+                )
+        counts["issues"] = len(issues)
+        return {
+            "ok": not issues,
+            "counts": counts,
+            "issues": issues,
+            "warnings": list(report.get("warnings", [])),
+        }
 
     def _optional_specs(self) -> dict[str, ToolSpec]:
         specs: dict[str, ToolSpec] = {}

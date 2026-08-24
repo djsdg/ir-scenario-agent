@@ -24,12 +24,13 @@ from .domain import (
     UseCase,
     UseCaseMatch,
 )
-from .library import ScenarioLibrary
+from .library import ScenarioLibrary, open_scenario_library
 from .mcp import MCPConfig, MCPServerConfig
 from .memory import MemoryStore
 from .plugins import PluginContext, PluginManager
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
+from .sqlite_library import SQLiteScenarioLibrary
 
 __all__ = [
     "AgentResult",
@@ -52,6 +53,7 @@ __all__ = [
     "PluginManager",
     "Scenario",
     "ScenarioLibrary",
+    "SQLiteScenarioLibrary",
     "ScenarioMatch",
     "ScenarioResolution",
     "Settings",
@@ -60,5 +62,6 @@ __all__ = [
     "SpecError",
     "UseCase",
     "UseCaseMatch",
+    "open_scenario_library",
     "read_document",
 ]

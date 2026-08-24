@@ -11,8 +11,21 @@ from ir_agent.domain import (
     CreateUseCaseRequest,
     IRRequirementInput,
     InfluenceFactor,
+    MoveUseCaseRequest,
+    TransitionRecordRequest,
+    UpdateScenarioRequest,
+    UpdateUseCaseRequest,
 )
 from ir_agent.library import ScenarioLibrary, tokenize
+
+
+class FakeEmbeddingProvider:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(texts)
+        return [[1.0, 0.0] for _ in texts]
 
 
 class ScenarioLibraryTests(unittest.TestCase):
@@ -39,6 +52,33 @@ class ScenarioLibraryTests(unittest.TestCase):
         self.assertIn("知", tokens)
         self.assertIn("知识", tokens)
         self.assertIn("知识库", tokens)
+
+    def test_configured_synonym_improves_alias_recall(self) -> None:
+        self.library.configure_matching(
+            {
+                "synonyms": {"异常检测": ["故障监测"]},
+                "lexical_weight": 0.75,
+                "tfidf_weight": 0.25,
+            }
+        )
+
+        matches = self.library.search("故障监测", top_k=5)
+
+        self.assertTrue(matches)
+        self.assertIn(matches[0].scenario.id, {"SCN-XXXX-001", "SCN-XXXX-002"})
+
+    def test_optional_embedding_is_fused_without_breaking_lexical_search(self) -> None:
+        provider = FakeEmbeddingProvider()
+        self.library.configure_matching(
+            {"lexical_weight": 0.60, "tfidf_weight": 0.20, "embedding_weight": 0.20}
+        )
+        self.library.configure_embedding(provider)
+
+        matches = self.library.search("企业知识库多轮检索问答", top_k=3)
+
+        self.assertTrue(provider.calls)
+        self.assertEqual(provider.calls[0][0], "企业知识库多轮检索问答")
+        self.assertEqual(matches[0].scenario.id, "scn_enterprise_knowledge_qa")
 
     def test_scenario_cannot_adopt_a_uc_owned_by_another_scenario(self) -> None:
         initial_count = len(self.library.list_scenarios())
@@ -198,6 +238,97 @@ class ScenarioLibraryTests(unittest.TestCase):
         uc_payload = json.loads(library.use_case_path.read_text(encoding="utf-8"))
         self.assertEqual(scenario_payload["use_cases"], [])
         self.assertIn(created.id, {item["id"] for item in uc_payload["use_cases"]})
+
+    def test_quality_report_finds_broken_uc_references(self) -> None:
+        payload = json.loads(self.library_path.read_text(encoding="utf-8"))
+        payload["scenarios"][0]["use_case_ids"].append("UC-MISSING")
+        orphan = dict(payload["use_cases"][0])
+        orphan["id"] = "UC-ORPHAN"
+        payload["use_cases"].append(orphan)
+        self.library_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        report = self.library.quality_report()
+
+        self.assertFalse(report["ok"])
+        issue_kinds = {item["kind"] for item in report["issues"]}
+        self.assertIn("missing_use_case_reference", issue_kinds)
+        self.assertIn("orphan_use_case", issue_kinds)
+
+    def test_update_transition_and_move_preserve_revisions_and_parent_rule(self) -> None:
+        scenario = self.library.create(
+            CreateScenarioRequest(
+                name="生命周期测试场景",
+                description="用于验证场景修改、状态流转和 UC 迁移。",
+                category="Scenario",
+                actor="测试系统",
+                influence_factors=[
+                    InfluenceFactor(
+                        name="测试硬件",
+                        kind="environment",
+                        dimension="hardware_environment",
+                        candidate_values=["测试节点"],
+                        selected_values=["测试节点"],
+                    )
+                ],
+                owner="test",
+                business_goal="验证生命周期能力",
+                actions=["执行测试"],
+                constraints=["仅用于测试"],
+                lifecycle="正常服务",
+            )
+        )
+        updated_scenario = self.library.update_scenario(
+            UpdateScenarioRequest(
+                scenario_id=scenario.id,
+                description="用于验证场景修改、状态流转和 UC 迁移的扩展描述。",
+            )
+        )
+        self.assertEqual(updated_scenario.revision, 2)
+
+        for workflow_status in ("Inwork", "Review", "Publish"):
+            updated_scenario = self.library.transition_record(
+                TransitionRecordRequest(
+                    record_type="scenario",
+                    record_id=scenario.id,
+                    workflow_status=workflow_status,
+                )
+            )
+        self.assertEqual(updated_scenario.workflow_status, "Publish")
+        self.assertEqual(updated_scenario.status, "published")
+
+        use_case = self.library.create_use_case(
+            CreateUseCaseRequest(
+                name="生命周期测试用例",
+                description="验证一个完整的 UC 可以被修改并迁移到另一个父场景。",
+                actor="测试系统",
+                preconditions=["测试场景已发布"],
+                trigger_event="执行迁移测试",
+                success_guarantee="UC 被准确迁移并保持完整行为链",
+                minimum_guarantee="迁移失败时原父场景关系保持不变",
+                main_success_scenario=["读取 UC", "切换父场景", "校验唯一归属"],
+                scenario_id=scenario.id,
+            )
+        )
+        updated_use_case = self.library.update_use_case(
+            UpdateUseCaseRequest(
+                use_case_id=use_case.id,
+                trigger_event="执行修改后的迁移测试",
+            )
+        )
+        self.assertEqual(updated_use_case.revision, 2)
+
+        moved = self.library.move_use_case(
+            MoveUseCaseRequest(
+                use_case_id=use_case.id,
+                target_scenario_id="SCN-XXXX-001",
+            )
+        )
+        self.assertEqual(moved.revision, 3)
+        self.assertNotIn(use_case.id, self.library.get_scenario(scenario.id).use_case_ids)
+        self.assertIn(use_case.id, self.library.get_scenario("SCN-XXXX-001").use_case_ids)
 
 
 if __name__ == "__main__":

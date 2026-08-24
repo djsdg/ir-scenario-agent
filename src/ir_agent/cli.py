@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -17,12 +18,15 @@ from .agent import (
 from .audit import AuditLogger
 from .config import Settings
 from .documents import read_document
-from .library import ScenarioLibrary
+from .library import open_scenario_library
 from .mcp import MCPConfig
 from .memory import MemoryStore
 from .plugins import PluginContext, PluginManager
+from .retrieval import OpenAIEmbeddingProvider
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
+from .sqlite_library import migrate_json_to_sqlite
+from .tools import ToolRegistry
 
 
 def _load_dotenv() -> None:
@@ -77,6 +81,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not load or save the local JSON session",
     )
     parser.add_argument("--show-tools", action="store_true", help="Print tool calls after each turn")
+    parser.add_argument(
+        "--validate-library",
+        action="store_true",
+        help="Run the local read-only library quality audit without calling a model",
+    )
+    parser.add_argument(
+        "--migrate-to-sqlite",
+        metavar="PATH",
+        help="Copy the selected JSON/directory library to a SQLite database and exit",
+    )
     return parser
 
 
@@ -157,6 +171,33 @@ def main(argv: list[str] | None = None) -> int:
         audit_path=args.audit_path,
         user_id=args.user_id,
     )
+
+    if args.migrate_to_sqlite:
+        try:
+            migrated = migrate_json_to_sqlite(
+                settings.library_path,
+                Path(args.migrate_to_sqlite),
+            )
+        except (OSError, ValueError, FileExistsError) as exc:
+            print(f"SQLite 迁移失败：{exc}", file=sys.stderr)
+            return 2
+        print(f"SQLite 场景库已创建：{migrated.path.resolve()}")
+        return 0
+
+    if args.validate_library:
+        try:
+            library = open_scenario_library(
+                settings.library_path,
+                use_case_path=settings.uc_library_path,
+            )
+            spec = SpecCatalog.from_file(settings.spec_path)
+            report = ToolRegistry(library, spec=spec).execute("validate_library", {})
+        except (OSError, ValueError, SpecError) as exc:
+            print(f"场景库检查失败：{exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if report.get("ok") else 1
+
     if args.model:
         settings = replace(settings, model=args.model)
     if args.no_structured_output:
@@ -169,10 +210,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    library = ScenarioLibrary(
+    library = open_scenario_library(
         settings.library_path,
         use_case_path=settings.uc_library_path,
     )
+    if settings.embedding_model:
+        try:
+            library.configure_embedding(
+                OpenAIEmbeddingProvider(
+                    api_key=settings.api_key,
+                    model=settings.embedding_model,
+                    base_url=settings.base_url,
+                    organization=settings.organization,
+                    timeout=settings.request_timeout,
+                )
+            )
+        except RuntimeError as exc:
+            print(f"Embedding 配置失败：{exc}", file=sys.stderr)
+            return 2
     try:
         spec = SpecCatalog.from_file(settings.spec_path)
     except SpecError as exc:

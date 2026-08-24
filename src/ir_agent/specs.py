@@ -412,6 +412,16 @@ def _fallback_spec() -> dict[str, Any]:
             "scenario_strong_threshold": 0.70,
             "use_case_reuse_threshold": 0.45,
             "ambiguity_margin": 0.08,
+            "lexical_weight": 0.75,
+            "tfidf_weight": 0.25,
+            "embedding_weight": 0.20,
+            "synonyms": {
+                "异常恢复": ["故障恢复", "恢复节点", "复位修复"],
+                "隔离": ["下电隔离", "节点隔离", "故障隔离"],
+                "反复复位": ["反复 core", "重复复位", "进程反复复位"],
+                "检索问答": ["知识库问答", "多轮问答", "问题回答"],
+                "证据链": ["可追溯回答", "来源追溯", "证据追溯"],
+            },
             "critical_dimensions_for_reuse": ["Actor", "上下文", "影响因素"],
             "actor_categories": {
                 "system": ["本系统", "系统自身", "软件", "进程"],

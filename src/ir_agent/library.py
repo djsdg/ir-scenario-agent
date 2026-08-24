@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 from threading import RLock
@@ -15,18 +17,24 @@ from .domain import (
     IRMatchResult,
     IRRequirementInput,
     InformationRequirement,
+    MoveUseCaseRequest,
     Scenario,
     ScenarioMatch,
+    TransitionRecordRequest,
+    UpdateScenarioRequest,
+    UpdateUseCaseRequest,
     UseCase,
     UseCaseMatch,
     utc_now,
 )
+from .retrieval import EmbeddingProvider, cosine_similarity
 
 
 class LibraryDocument(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: int = Field(default=2, ge=2)
+    revision: int = Field(default=0, ge=0)
     requirements: list[InformationRequirement] = Field(default_factory=list)
     use_cases: list[UseCase] = Field(default_factory=list)
     scenarios: list[Scenario] = Field(default_factory=list)
@@ -152,6 +160,33 @@ def _configured_strings(
     return configured or defaults
 
 
+def _configured_weight(rules: dict[str, object], key: str, default: float) -> float:
+    try:
+        value = float(rules.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0.0 else default
+
+
+def _configured_synonyms(rules: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    raw = rules.get("synonyms")
+    if not isinstance(raw, dict):
+        return {}
+    synonyms: dict[str, tuple[str, ...]] = {}
+    for canonical, aliases in raw.items():
+        if not isinstance(aliases, (list, tuple)):
+            continue
+        values = tuple(
+            str(alias).strip()
+            for alias in aliases
+            if alias is not None and str(alias).strip()
+        )
+        canonical_text = str(canonical).strip()
+        if canonical_text and values:
+            synonyms[canonical_text] = tuple(dict.fromkeys(values))
+    return synonyms
+
+
 def tokenize(text: str) -> list[str]:
     """Tokenize words, Chinese characters, and short Chinese phrases.
 
@@ -232,7 +267,28 @@ def _scenario_conflicts(
     return conflicts
 
 
-def _coverage(query: str, document: str) -> tuple[float, set[str]]:
+def _expand_synonyms(text: str, synonyms: dict[str, tuple[str, ...]] | None = None) -> str:
+    if not synonyms:
+        return text
+    normalized = _compact(text)
+    additions: list[str] = []
+    for canonical, aliases in synonyms.items():
+        terms = (canonical, *aliases)
+        if any(_compact(term) in normalized for term in terms):
+            # Add one canonical evidence token instead of copying every alias;
+            # this improves recall without inflating the query denominator.
+            additions.append(canonical)
+    return " ".join([text, *additions])
+
+
+def _coverage(
+    query: str,
+    document: str,
+    *,
+    synonyms: dict[str, tuple[str, ...]] | None = None,
+) -> tuple[float, set[str]]:
+    query = _expand_synonyms(query, synonyms)
+    document = _expand_synonyms(document, synonyms)
     query_terms = set(tokenize(query))
     if not query_terms:
         return 0.0, set()
@@ -241,6 +297,83 @@ def _coverage(query: str, document: str) -> tuple[float, set[str]]:
     total_weight = sum(_token_weight(token) for token in query_terms)
     matched_weight = sum(_token_weight(token) for token in matched)
     return (matched_weight / total_weight if total_weight else 0.0), matched
+
+
+def _hybrid_scores(
+    query: str,
+    documents: list[str],
+    *,
+    synonyms: dict[str, tuple[str, ...]] | None = None,
+    lexical_weight: float = 0.75,
+    tfidf_weight: float = 0.25,
+    embedding_provider: EmbeddingProvider | None = None,
+    embedding_weight: float = 0.0,
+) -> list[tuple[float, set[str]]]:
+    """Return explainable lexical + TF-IDF scores for one query and corpus."""
+
+    if not documents:
+        return []
+    weight_total = lexical_weight + tfidf_weight + (embedding_weight if embedding_provider else 0.0)
+    if weight_total <= 0:
+        lexical_weight, tfidf_weight, embedding_weight = 1.0, 0.0, 0.0
+        weight_total = 1.0
+    lexical_weight /= weight_total
+    tfidf_weight /= weight_total
+    embedding_weight = (embedding_weight if embedding_provider else 0.0) / weight_total
+
+    expanded_query = _expand_synonyms(query, synonyms)
+    query_terms = set(tokenize(expanded_query))
+    expanded_documents = [_expand_synonyms(document, synonyms) for document in documents]
+    document_terms = [tokenize(document) for document in expanded_documents]
+    document_frequency: Counter[str] = Counter()
+    for terms in document_terms:
+        document_frequency.update(set(terms))
+    document_count = len(document_terms)
+    idf = {
+        term: math.log((document_count + 1) / (frequency + 1)) + 1.0
+        for term, frequency in document_frequency.items()
+    }
+    query_vector = {term: idf.get(term, 1.0) for term in query_terms}
+    query_norm = math.sqrt(sum(value * value for value in query_vector.values())) or 1.0
+
+    embedding_scores: list[float] | None = None
+    if embedding_provider is not None and embedding_weight > 0:
+        try:
+            vectors = embedding_provider.embed([expanded_query, *expanded_documents])
+            if len(vectors) == len(expanded_documents) + 1:
+                embedding_scores = [
+                    cosine_similarity(vectors[0], vector) for vector in vectors[1:]
+                ]
+        except Exception:
+            # Semantic retrieval is an enhancement; lexical retrieval remains
+            # available when the remote embedding service is unavailable.
+            embedding_scores = None
+
+    results: list[tuple[float, set[str]]] = []
+    for document, terms in zip(expanded_documents, document_terms):
+        term_counts = Counter(terms)
+        document_vector = {
+            term: (1.0 + math.log(count)) * idf.get(term, 1.0)
+            for term, count in term_counts.items()
+        }
+        dot = sum(query_vector.get(term, 0.0) * value for term, value in document_vector.items())
+        document_norm = math.sqrt(sum(value * value for value in document_vector.values())) or 1.0
+        tfidf_score = dot / (query_norm * document_norm)
+        coverage, matched = _coverage(expanded_query, document)
+        semantic_score = embedding_scores[len(results)] if embedding_scores else 0.0
+        effective_embedding_weight = embedding_weight if embedding_scores else 0.0
+        effective_total = lexical_weight + tfidf_weight + effective_embedding_weight
+        score = min(
+            1.0,
+            (
+                lexical_weight * coverage
+                + tfidf_weight * tfidf_score
+                + effective_embedding_weight * semantic_score
+            )
+            / (effective_total or 1.0),
+        )
+        results.append((score, matched))
+    return results
 
 
 def _token_weight(token: str) -> float:
@@ -280,6 +413,7 @@ class ScenarioLibrary:
             self.use_case_path = None
         self._lock = RLock()
         self._matching_rules: dict[str, object] = {}
+        self._embedding_provider: EmbeddingProvider | None = None
         self._ensure_exists()
 
     def configure_matching(self, rules: dict[str, object] | None) -> None:
@@ -293,6 +427,12 @@ class ScenarioLibrary:
 
         with self._lock:
             return deepcopy(self._matching_rules)
+
+    def configure_embedding(self, provider: EmbeddingProvider | None) -> None:
+        """Attach an optional semantic retriever without changing library data."""
+
+        with self._lock:
+            self._embedding_provider = provider
 
     def _ensure_exists(self) -> None:
         if self.path.exists():
@@ -372,6 +512,94 @@ class ScenarioLibrary:
         with self._lock:
             return self._read()
 
+    def quality_report(self) -> dict[str, object]:
+        """Report referential-integrity problems without changing the library."""
+
+        document = self.document()
+        scenarios = document.scenarios
+        use_cases = document.use_cases
+        issues: list[dict[str, str]] = []
+        warnings: list[dict[str, str]] = []
+        scenario_by_id: dict[str, Scenario] = {}
+        use_case_by_id: dict[str, UseCase] = {}
+
+        def issue(kind: str, record_id: str, message: str, *, warning: bool = False) -> None:
+            target = warnings if warning else issues
+            target.append({"kind": kind, "record_id": record_id, "message": message})
+
+        for scenario in scenarios:
+            if scenario.id in scenario_by_id:
+                issue("duplicate_scenario_id", scenario.id, "场景 ID 重复。")
+            else:
+                scenario_by_id[scenario.id] = scenario
+
+        for use_case in use_cases:
+            if use_case.id in use_case_by_id:
+                issue("duplicate_use_case_id", use_case.id, "UC ID 重复。")
+            else:
+                use_case_by_id[use_case.id] = use_case
+
+        parent_refs: dict[str, list[str]] = {}
+        for scenario in scenarios:
+            if len(set(scenario.use_case_ids)) != len(scenario.use_case_ids):
+                issue("duplicate_use_case_reference", scenario.id, "场景中的 UC 引用重复。")
+            for use_case_id in scenario.use_case_ids:
+                parent_refs.setdefault(use_case_id, []).append(scenario.id)
+                use_case = use_case_by_id.get(use_case_id)
+                if use_case is None:
+                    issue(
+                        "missing_use_case_reference",
+                        scenario.id,
+                        f"引用的 UC 不存在：{use_case_id}。",
+                    )
+
+        for use_case in use_cases:
+            parent_ids = parent_refs.get(use_case.id, [])
+            if not parent_ids:
+                issue(
+                    "orphan_use_case",
+                    use_case.id,
+                    "UC 没有被任何场景引用。",
+                )
+
+        for use_case_id, parent_ids in parent_refs.items():
+            unique_parent_ids = set(parent_ids)
+            if len(unique_parent_ids) > 1:
+                issue(
+                    "multiple_parents",
+                    use_case_id,
+                    "UC 被多个场景引用：" + "、".join(sorted(unique_parent_ids)) + "。",
+                )
+
+        known_ir_ids = {
+            value
+            for requirement in document.requirements
+            for value in (requirement.id, requirement.code)
+            if value
+        }
+        for record in [*scenarios, *use_cases]:
+            for source_ir_id in record.source_ir_ids:
+                if source_ir_id not in known_ir_ids:
+                    issue(
+                        "unresolved_ir_trace",
+                        record.id,
+                        f"来源 IR 未在当前库中找到：{source_ir_id}。",
+                        warning=True,
+                    )
+
+        return {
+            "ok": not issues,
+            "counts": {
+                "requirements": len(document.requirements),
+                "scenarios": len(scenarios),
+                "use_cases": len(use_cases),
+                "issues": len(issues),
+                "warnings": len(warnings),
+            },
+            "issues": issues,
+            "warnings": warnings,
+        }
+
     def list_requirements(self) -> list[InformationRequirement]:
         return self.document().requirements
 
@@ -443,9 +671,14 @@ class ScenarioLibrary:
         if not query_tokens:
             return []
 
-        matches: list[ScenarioMatch] = []
-        for scenario in self.list_scenarios():
-            searchable_text = " ".join(
+        rules = self.matching_rules()
+        synonyms = _configured_synonyms(rules)
+        lexical_weight = _configured_weight(rules, "lexical_weight", 0.75)
+        tfidf_weight = _configured_weight(rules, "tfidf_weight", 0.25)
+        embedding_weight = _configured_weight(rules, "embedding_weight", 0.20)
+        scenarios = self.list_scenarios()
+        searchable_documents = [
+            " ".join(
                 [
                     scenario.name,
                     scenario.description,
@@ -455,12 +688,24 @@ class ScenarioLibrary:
                     *scenario.tags,
                 ]
             )
-            coverage, matched = _coverage(query, searchable_text)
+            for scenario in scenarios
+        ]
+        scored_documents = _hybrid_scores(
+            query,
+            searchable_documents,
+            synonyms=synonyms,
+            lexical_weight=lexical_weight,
+            tfidf_weight=tfidf_weight,
+            embedding_provider=self._embedding_provider,
+            embedding_weight=embedding_weight,
+        )
+        matches: list[ScenarioMatch] = []
+        for scenario, (coverage, matched) in zip(scenarios, scored_documents):
             if not matched:
                 continue
 
-            name_coverage, _ = _coverage(query, scenario.name)
-            tag_coverage, _ = _coverage(query, " ".join(scenario.tags))
+            name_coverage, _ = _coverage(query, scenario.name, synonyms=synonyms)
+            tag_coverage, _ = _coverage(query, " ".join(scenario.tags), synonyms=synonyms)
             score = min(1.0, 0.65 * coverage + 0.25 * name_coverage + 0.10 * tag_coverage)
             if score >= min_score:
                 matches.append(
@@ -492,11 +737,14 @@ class ScenarioLibrary:
                 raise ValueError(f"Unknown scenario id: {scenario_id}")
             allowed_use_case_ids = set(scenarios[scenario_id].use_case_ids)
         query_terms = set(tokenize(query))
-        matches: list[UseCaseMatch] = []
-        for use_case in self.list_use_cases():
-            if allowed_use_case_ids is not None and use_case.id not in allowed_use_case_ids:
-                continue
-            document = " ".join(
+        rules = self.matching_rules()
+        synonyms = _configured_synonyms(rules)
+        lexical_weight = _configured_weight(rules, "lexical_weight", 0.75)
+        tfidf_weight = _configured_weight(rules, "tfidf_weight", 0.25)
+        embedding_weight = _configured_weight(rules, "embedding_weight", 0.20)
+        use_cases = self.list_use_cases()
+        searchable_documents = [
+            " ".join(
                 [
                     use_case.name,
                     use_case.description,
@@ -512,10 +760,24 @@ class ScenarioLibrary:
                     *use_case.tags,
                 ]
             )
-            coverage, matched = _coverage(query, document)
+            for use_case in use_cases
+        ]
+        scored_documents = _hybrid_scores(
+            query,
+            searchable_documents,
+            synonyms=synonyms,
+            lexical_weight=lexical_weight,
+            tfidf_weight=tfidf_weight,
+            embedding_provider=self._embedding_provider,
+            embedding_weight=embedding_weight,
+        )
+        matches: list[UseCaseMatch] = []
+        for use_case, (coverage, matched) in zip(use_cases, scored_documents):
+            if allowed_use_case_ids is not None and use_case.id not in allowed_use_case_ids:
+                continue
             if not matched:
                 continue
-            name_coverage, _ = _coverage(query, use_case.name)
+            name_coverage, _ = _coverage(query, use_case.name, synonyms=synonyms)
             score = min(1.0, 0.8 * coverage + 0.2 * name_coverage)
             if score >= min_score:
                 matches.append(
@@ -537,6 +799,7 @@ class ScenarioLibrary:
     ) -> IRMatchResult:
         _validate_search_limits(top_k, min_score)
         rules = self.matching_rules()
+        synonyms = _configured_synonyms(rules)
         scenario_reuse_threshold = _configured_threshold(
             rules, "scenario_reuse_threshold", _SCENARIO_REUSE_THRESHOLD
         )
@@ -578,7 +841,9 @@ class ScenarioLibrary:
                     *scenario.tags,
                 ]
             )
-            actor_score, actor_terms = _coverage(ir.who or "", scenario.actor)
+            actor_score, actor_terms = _coverage(
+                ir.who or "", scenario.actor, synonyms=synonyms
+            )
             context_score, context_terms = _coverage(
                 " ".join([ir.when or "", ir.where or ""]),
                 " ".join(
@@ -588,6 +853,7 @@ class ScenarioLibrary:
                         *scenario.affected_components,
                     ]
                 ),
+                synonyms=synonyms,
             )
             impact_values = [
                 value
@@ -597,12 +863,16 @@ class ScenarioLibrary:
             impact_score, impact_terms = _coverage(
                 " ".join([ir.where or "", ir.description, *ir.constraints, *ir.how_much]),
                 " ".join([*impact_values, *scenario.affected_components]),
+                synonyms=synonyms,
             )
             constraint_score, constraint_terms = _coverage(
                 " ".join([*ir.constraints, *ir.how_much]),
                 " ".join(scenario.constraints),
+                synonyms=synonyms,
             )
-            intent_score, intent_terms = _coverage(intent_query, intent_document)
+            intent_score, intent_terms = _coverage(
+                intent_query, intent_document, synonyms=synonyms
+            )
             score = min(
                 1.0,
                 0.55 * intent_score
@@ -784,6 +1054,157 @@ class ScenarioLibrary:
             self._atomic_write(document)
             return use_case
 
+    def update_scenario(self, request: UpdateScenarioRequest) -> Scenario:
+        with self._lock:
+            document = self._read()
+            for index, scenario in enumerate(document.scenarios):
+                if scenario.id != request.scenario_id:
+                    continue
+                if scenario.workflow_status == "Obsolete":
+                    raise ValueError("Obsolete scenarios cannot be edited; create a new revision instead")
+                updates = request.model_dump(exclude={"scenario_id"}, exclude_unset=True)
+                if "name" in updates:
+                    duplicate = any(
+                        other.id != scenario.id
+                        and other.name.casefold() == str(updates["name"]).casefold()
+                        for other in document.scenarios
+                    )
+                    if duplicate:
+                        raise ValueError(f"A scenario named {updates['name']!r} already exists")
+                updated = scenario.model_copy(
+                    update={
+                        **updates,
+                        "revision": scenario.revision + 1,
+                        "updated_at": utc_now(),
+                    }
+                )
+                document.scenarios[index] = updated
+                self._atomic_write(document)
+                return updated
+            raise KeyError(f"Unknown scenario: {request.scenario_id}")
+
+    def update_use_case(self, request: UpdateUseCaseRequest) -> UseCase:
+        with self._lock:
+            document = self._read()
+            for index, use_case in enumerate(document.use_cases):
+                if use_case.id != request.use_case_id:
+                    continue
+                if use_case.workflow_status == "Obsolete":
+                    raise ValueError("Obsolete use cases cannot be edited; create a new revision instead")
+                updates = request.model_dump(exclude={"use_case_id"}, exclude_unset=True)
+                if "name" in updates:
+                    duplicate = any(
+                        other.id != use_case.id
+                        and other.name.casefold() == str(updates["name"]).casefold()
+                        for other in document.use_cases
+                    )
+                    if duplicate:
+                        raise ValueError(f"A use case named {updates['name']!r} already exists")
+                updated = use_case.model_copy(
+                    update={
+                        **updates,
+                        "revision": use_case.revision + 1,
+                        "updated_at": utc_now(),
+                    }
+                )
+                document.use_cases[index] = updated
+                self._atomic_write(document)
+                return updated
+            raise KeyError(f"Unknown use case: {request.use_case_id}")
+
+    def transition_record(self, request: TransitionRecordRequest) -> Scenario | UseCase:
+        with self._lock:
+            document = self._read()
+            if request.record_type == "scenario":
+                for index, scenario in enumerate(document.scenarios):
+                    if scenario.id != request.record_id:
+                        continue
+                    _validate_workflow_transition(
+                        scenario.workflow_status, request.workflow_status
+                    )
+                    updated = scenario.model_copy(
+                        update={
+                            "workflow_status": request.workflow_status,
+                            "status": _record_status_for_workflow(request.workflow_status),
+                            "revision": scenario.revision + 1,
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    document.scenarios[index] = updated
+                    self._atomic_write(document)
+                    return updated
+                raise KeyError(f"Unknown scenario: {request.record_id}")
+
+            for index, use_case in enumerate(document.use_cases):
+                if use_case.id != request.record_id:
+                    continue
+                _validate_workflow_transition(
+                    use_case.workflow_status, request.workflow_status
+                )
+                updated = use_case.model_copy(
+                    update={
+                        "workflow_status": request.workflow_status,
+                        "status": _record_status_for_workflow(request.workflow_status),
+                        "revision": use_case.revision + 1,
+                        "updated_at": utc_now(),
+                    }
+                )
+                document.use_cases[index] = updated
+                self._atomic_write(document)
+                return updated
+            raise KeyError(f"Unknown use case: {request.record_id}")
+
+    def move_use_case(self, request: MoveUseCaseRequest) -> UseCase:
+        with self._lock:
+            document = self._read()
+            use_case_index = next(
+                (index for index, item in enumerate(document.use_cases) if item.id == request.use_case_id),
+                None,
+            )
+            if use_case_index is None:
+                raise KeyError(f"Unknown use case: {request.use_case_id}")
+            if not any(item.id == request.target_scenario_id for item in document.scenarios):
+                raise KeyError(f"Unknown scenario: {request.target_scenario_id}")
+
+            parent_ids = [
+                scenario.id
+                for scenario in document.scenarios
+                if request.use_case_id in scenario.use_case_ids
+            ]
+            unique_parent_ids = list(dict.fromkeys(parent_ids))
+            if len(unique_parent_ids) > 1:
+                raise ValueError(
+                    "Cannot move a UC with multiple parents: "
+                    + ", ".join(unique_parent_ids)
+                )
+            if unique_parent_ids == [request.target_scenario_id]:
+                return document.use_cases[use_case_index]
+
+            now = utc_now()
+            for index, scenario in enumerate(document.scenarios):
+                use_case_ids = [
+                    value for value in scenario.use_case_ids if value != request.use_case_id
+                ]
+                if scenario.id == request.target_scenario_id:
+                    use_case_ids.append(request.use_case_id)
+                if use_case_ids == scenario.use_case_ids:
+                    continue
+                document.scenarios[index] = scenario.model_copy(
+                    update={
+                        "use_case_ids": list(dict.fromkeys(use_case_ids)),
+                        "revision": scenario.revision + 1,
+                        "updated_at": now,
+                    }
+                )
+
+            current = document.use_cases[use_case_index]
+            updated_use_case = current.model_copy(
+                update={"revision": current.revision + 1, "updated_at": now}
+            )
+            document.use_cases[use_case_index] = updated_use_case
+            self._atomic_write(document)
+            return updated_use_case
+
     def link_use_cases(self, scenario_id: str, use_case_ids: list[str]) -> Scenario:
         with self._lock:
             document = self._read()
@@ -818,11 +1239,53 @@ class ScenarioLibrary:
             raise KeyError(f"Unknown scenario: {scenario_id}")
 
 
+def open_scenario_library(
+    path: str | Path,
+    *,
+    use_case_path: str | Path | None = None,
+) -> ScenarioLibrary:
+    """Open JSON/directory storage or SQLite based on the file extension."""
+
+    raw_path = Path(path)
+    if raw_path.suffix.casefold() in {".sqlite", ".sqlite3", ".db"}:
+        if use_case_path is not None:
+            raise ValueError("SQLite libraries store UC records in the same database")
+        from .sqlite_library import SQLiteScenarioLibrary
+
+        return SQLiteScenarioLibrary(raw_path)
+    return ScenarioLibrary(raw_path, use_case_path=use_case_path)
+
+
 def _validate_search_limits(top_k: int, min_score: float) -> None:
     if not 1 <= top_k <= 20:
         raise ValueError("top_k must be between 1 and 20")
     if not 0.0 <= min_score <= 1.0:
         raise ValueError("min_score must be between 0 and 1")
+
+
+_WORKFLOW_TRANSITIONS: dict[str, set[str]] = {
+    "Draft": {"Draft", "Inwork", "Obsolete"},
+    "Inwork": {"Inwork", "Draft", "Review", "Obsolete"},
+    "Review": {"Review", "Inwork", "Publish", "Obsolete"},
+    "Publish": {"Publish", "Obsolete"},
+    "Obsolete": {"Obsolete"},
+}
+
+
+def _validate_workflow_transition(current: str, target: str) -> None:
+    allowed = _WORKFLOW_TRANSITIONS.get(current, set())
+    if target not in allowed:
+        raise ValueError(f"Invalid workflow transition: {current} -> {target}")
+
+
+def _record_status_for_workflow(workflow_status: str) -> str:
+    return {
+        "Draft": "draft",
+        "Inwork": "working",
+        "Review": "working",
+        "Publish": "published",
+        "Obsolete": "archived",
+    }.get(workflow_status, "draft")
 
 
 def _ensure_known_ids(values: list[str], known: set[str], label: str) -> None:

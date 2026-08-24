@@ -26,10 +26,15 @@ docs = [
 tui = [
   "textual>=0.50.0",
 ]
+web = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+]
 
 [project.scripts]
 ir-agent = "ir_agent.cli:main"
 ir-agent-tui = "ir_agent.tui:main"
+ir-agent-api = "ir_agent.api:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

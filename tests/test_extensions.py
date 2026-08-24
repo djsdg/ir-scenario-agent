@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from ir_agent.agent import IRScenarioAgent
+from ir_agent.api import _build_parser as _build_api_parser
 from ir_agent.config import Settings
 from ir_agent.library import ScenarioLibrary
 from ir_agent.mcp import MCPConfig
@@ -201,6 +202,21 @@ class ExtensionTests(unittest.TestCase):
         self.assertEqual(args.api_mode, "chat_completions")
         self.assertEqual(args.uc_library, "library\\uc\\use_cases.json")
         self.assertEqual(args.input_file, "request.md")
+        self.assertTrue(args.auto_approve_writes)
+
+    def test_api_parser_supports_storage_and_token_options(self) -> None:
+        args = _build_api_parser().parse_args(
+            [
+                "--library",
+                "library.sqlite3",
+                "--api-token",
+                "secret",
+                "--auto-approve-writes",
+            ]
+        )
+
+        self.assertEqual(args.library, "library.sqlite3")
+        self.assertEqual(args.api_token, "secret")
         self.assertTrue(args.auto_approve_writes)
 
 

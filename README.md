@@ -18,9 +18,13 @@
   - `save_ir_requirement` / `get_ir_requirement`：保存和读取结构化 IR。
   - `search_scenarios` / `get_scenario`：检索和读取场景。
   - `search_use_cases` / `get_use_case` / `list_use_cases`：检索和读取 UC。
+  - `validate_library`：只读检查 IR/SC/UC 数量、重复 ID、SC→UC 引用、孤儿 UC、IR 追溯和 Spec 必填字段。
   - `create_scenario`：创建通过必填校验的场景草稿。
   - `create_use_case`：创建完整 UC 并自动挂到唯一父场景。
   - `link_scenario_use_cases`：把尚未归属的 UC 挂到一个场景；已归属其他场景的 UC 会被拒绝。
+  - `update_scenario` / `update_use_case`：修改内容字段并递增 revision，已废弃记录不可直接覆盖。
+  - `transition_record`：按 Draft → Inwork → Review → Publish → Obsolete 流转 SC/UC 状态。
+  - `move_use_case`：迁移 UC 的唯一父 SC，并同步更新两侧 revision。
 - 匹配结果区分四种决策：复用场景和 UC、复用场景但新增 UC、新增场景和 UC、信息不足待澄清。
 - 完整 IR 匹配会返回候选分差和硬冲突；Actor、生命周期、影响部件或范围明确冲突，或最高/次高候选过于接近时，会转为人工澄清，避免误复用。
 - 匹配保留中文单字、二/三字短语和 How Much/DFX 证据；Actor、上下文、影响因素等关键维度未覆盖时，即使总分较高也不会自动复用。
@@ -28,6 +32,7 @@
 - 支持一个 IR 返回多个场景候选、一个 SC 关联多个 UC；每个 UC 只能归属一个父 SC。新增时按单个 SC/UC 草稿分别审批，避免把独立行为链强行合并。
 - 使用 `config/ir_sc_uc_spec.json` 约束 IR→SC→UC 映射、场景类别/状态、六类影响因素维度和质量输出；不把 IR 直接当 SC。
 - Spec 的 `matching` 段可配置复用阈值、候选歧义分差和领域同义词/冲突词；更换业务领域时优先改配置，不必修改匹配代码。
+- 匹配默认使用关键词证据 + TF-IDF 的混合检索，并支持 Spec 同义词；设置 `IR_AGENT_EMBEDDING_MODEL` 后会叠加 OpenAI 兼容 Embedding，服务不可用时自动回退。
 - 场景硬性校验 `description`、`category`、`business_goal`、`actor`、`actions`、`lifecycle`、`constraints`、`influence_factors`、`owner`；影响因素至少有一个选中值。
 - UC 硬性校验前置条件、触发事件、成功/最小保证和主成功场景，拒绝写入空壳 UC。
 - 支持项目级 Skill：从 `skills/**/SKILL.md` 自动发现、按需求选择，也可以由 agent 搜索/加载。
@@ -39,9 +44,11 @@
 - 提供可选 Textual TUI：多行粘贴 IR/SC/UC、后台执行模型请求、显示匹配结果/工具调用，并支持写入与 MCP 授权弹窗。
 - TUI 的 IR 文档和场景库读取在后台任务执行；切换场景库时会隔离旧会话上下文，结果 JSON 同时记录输入来源、SC/UC 库和 Spec 路径。
 - Responses 模式使用严格 JSON Schema；Chat Completions 模式使用 JSON mode 并由 Pydantic 做最终校验，方便后续 Web/API 消费；CLI 默认把它渲染成人类可读摘要。
+- 最终结构化结果会再次对照当前场景库和工具返回的真实 ID；如果模型输出了不存在或未由写入工具产生的 SC/UC 编号，会自动降级为待澄清，不把模型文本当成事实。
 - 场景库和记忆写入工具默认需要应用层人工批准；批准、拒绝、耗时和结果会写入 JSONL 审计日志。
 - API 临时失败支持指数退避重试；会话超过本地阈值时优先使用 `/responses/compact`，不可用时使用有界本地回退。
 - 本地 JSON 场景库，开箱即用；后续可以替换成 PostgreSQL、向量数据库或企业知识库。
+- 场景库也支持 SQLite：将 `IR_AGENT_LIBRARY_PATH` 或 `--library` 指向 `.sqlite3/.sqlite/.db` 即启用 WAL、事务写入和过期快照保护。
 - 会话上下文可落盘到 `data/sessions/`，默认 `store=False`，不依赖服务端线程状态。
 - 工具参数和领域对象使用 Pydantic 校验，减少模型生成脏数据的影响。
 
@@ -84,9 +91,11 @@ IR_AGENT_STRUCTURED_OUTPUT=true
 IR_AGENT_REQUIRE_TOOL_APPROVAL=true
 IR_AGENT_AUDIT_PATH=data/audit.jsonl
 IR_AGENT_SPEC_PATH=config/ir_sc_uc_spec.json
+IR_AGENT_EMBEDDING_MODEL=
+IR_AGENT_API_TOKEN=
 ```
 
-场景库支持两种存储方式：默认的 `data/scenario_library.json` 是 IR、SC、UC 单文件兼容模式；如果把 `IR_AGENT_LIBRARY_PATH` 配置为目录，例如 `data/scene_library`，Agent 会使用 `data/scene_library/scenarios.json` 和 `data/scene_library/uc/use_cases.json`。也可以通过 `IR_AGENT_UC_LIBRARY_PATH` 或启动参数 `--uc-library` 单独指定 UC 库文件。
+场景库支持三种存储方式：默认的 `data/scenario_library.json` 是 IR、SC、UC 单文件兼容模式；如果把 `IR_AGENT_LIBRARY_PATH` 配置为目录，例如 `data/scene_library`，Agent 会使用 `data/scene_library/scenarios.json` 和 `data/scene_library/uc/use_cases.json`；如果路径是 `.sqlite3/.sqlite/.db`，则启用 SQLite 事务库。也可以通过 `IR_AGENT_UC_LIBRARY_PATH` 或启动参数 `--uc-library` 单独指定 UC 库文件。
 
 默认会加载：
 
@@ -118,7 +127,23 @@ ir-agent-tui --ir-path .\examples\ir_sanitized.txt --library .\data\scenario_lib
 - `IR 文档路径`：支持 `.txt`、`.md`、`.json`、`.docx`、`.pdf`；
 - `场景库路径`：可以填写单个 JSON 文件，也可以填写场景库目录。填写目录时自动使用目录下的 `scenarios.json` 和 `uc/use_cases.json`。
 
-点击“读取 IR 并发送”后，程序会先校验两个路径、读取 IR，再用该场景库执行匹配；也可以继续直接粘贴文本并点击“发送”。输出区分为“对话”“候选对比”“工具日志”三个视图；“候选对比”分别展示 SC 表和按父 SC 过滤的 UC 表，包含名称、分数、命中维度、缺口和冲突，下方保留逐项解释。右侧显示本轮决策摘要，并提供打开结果文件/输出目录按钮。使用 `Ctrl+L` 清空输出显示，`Ctrl+Q` 退出。每轮结果会保存到 `IR_AGENT_OUTPUT_DIR/<session_id>/`，界面会显示绝对输出路径；当前生效的场景库、UC 库、Spec、输出目录和审计日志路径也会显示在右侧。TUI 默认仍会对场景库/记忆写入和 MCP 调用弹窗确认；本地调试时可使用 `--auto-approve-writes` 自动批准写入。
+点击“读取 IR 并发送”后，程序会先校验两个路径、读取 IR，再用该场景库执行匹配；也可以继续直接粘贴文本并点击“发送”。输出区分为“对话”“候选对比”“工具日志”三个视图；“候选对比”分别展示 SC 表和按父 SC 过滤的 UC 表，包含名称、分数、命中维度、缺口和冲突，下方保留逐项解释。点击表格行后可以加入一个或多个 SC/UC，填充确认/编辑提示，或确认后继续发送；“检查库质量”按钮会直接触发只读审计。右侧显示本轮决策摘要，并提供打开结果文件/输出目录按钮。使用 `Ctrl+L` 清空输出显示，`Ctrl+Q` 退出。每轮结果会保存到 `IR_AGENT_OUTPUT_DIR/<session_id>/`，界面会显示绝对输出路径；当前生效的场景库、UC 库、Spec、输出目录和审计日志路径也会显示在右侧。TUI 默认仍会对场景库/记忆写入和 MCP 调用弹窗确认；本地调试时可使用 `--auto-approve-writes` 自动批准写入。
+
+本地库检查和迁移不需要调用大模型：
+
+```powershell
+ir-agent --validate-library --library .\data\scenario_library.json
+ir-agent --migrate-to-sqlite .\data\scenario_library.sqlite3 --library .\data\scenario_library.json
+```
+
+需要给其他系统调用时，可以安装可选 Web 依赖并启动 REST API：
+
+```powershell
+pip install -e ".[web]"
+ir-agent-api --library .\data\scenario_library.sqlite3 --api-token "$env:IR_AGENT_API_TOKEN"
+```
+
+`GET /health`、`POST /match`、`GET /scenarios`、`GET /use-cases` 和 `POST /library/validate` 为查询接口；`POST /agent/run` 需要 API token。生产环境应放在 HTTPS 反向代理后，并设置 token、访问控制和日志脱敏。
 
 也可以直接执行一次：
 
@@ -267,6 +292,7 @@ flowchart LR
 ├── plugins/                    # plugin.json + Python 插件
 ├── src/ir_agent/
 │   ├── agent.py                # 双协议工具循环和会话状态
+│   ├── api.py                  # 可选 REST API 与 token 保护
 │   ├── audit.py                # JSONL 审计日志和敏感字段脱敏
 │   ├── cli.py                  # 命令行入口
 │   ├── config.py               # 环境变量配置

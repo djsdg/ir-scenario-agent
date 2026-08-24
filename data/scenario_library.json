@@ -459,7 +459,7 @@
       "id": "scn_enterprise_knowledge_qa",
       "name": "企业知识库多轮检索问答",
       "description": "用户围绕企业制度、产品文档和 FAQ 进行多轮提问，系统结合上下文检索证据并给出可追溯回答。",
-      "category": "业务场景",
+      "category": "Scenario",
       "actor": "企业知识用户",
       "influence_factors": [
         {
@@ -519,7 +519,7 @@
       "id": "scn_customer_feedback_classification",
       "name": "客户反馈分类与路由",
       "description": "从客服对话和用户反馈中识别主题、意图和紧急程度，并路由到相应团队或处理流程。",
-      "category": "业务场景",
+      "category": "Scenario",
       "actor": "客服人员",
       "influence_factors": [
         {
@@ -576,7 +576,7 @@
       "id": "scn_multi_hop_evidence_retrieval",
       "name": "多跳证据检索与聚合",
       "description": "对跨文档、跨实体或跨时间范围的 IR 需求分别召回证据，再合并成可审计证据链。",
-      "category": "技术场景",
+      "category": "Scenario",
       "actor": "知识分析人员",
       "influence_factors": [
         {

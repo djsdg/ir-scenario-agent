@@ -107,6 +107,7 @@ class UseCase(BaseModel):
     security_level: str | None = Field(default=None, max_length=100)
     tags: list[str] = Field(default_factory=list, max_length=50)
     source_ir_ids: list[str] = Field(default_factory=list, max_length=50)
+    revision: int = Field(default=1, ge=1)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -138,6 +139,7 @@ class Scenario(BaseModel):
     ir_intent: str = Field(default="", max_length=4_000)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    revision: int = Field(default=1, ge=1)
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
@@ -221,6 +223,72 @@ class CreateUseCaseRequest(BaseModel):
     tags: list[str] = Field(default_factory=list, max_length=50)
     source_ir_ids: list[str] = Field(default_factory=list, max_length=50)
     scenario_id: str = Field(min_length=1, max_length=120)
+
+
+class UpdateScenarioRequest(BaseModel):
+    """Partial content update; workflow changes use a separate transition request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenario_id: str = Field(min_length=1, max_length=120)
+    name: str | None = Field(default=None, min_length=3, max_length=300)
+    description: str | None = Field(default=None, min_length=10, max_length=8_000)
+    category: str | None = Field(default=None, min_length=1, max_length=200)
+    actor: str | None = Field(default=None, min_length=1, max_length=1_000)
+    influence_factors: list[InfluenceFactor] | None = Field(default=None, max_length=100)
+    owner: str | None = Field(default=None, min_length=1, max_length=300)
+    business_goal: str | None = Field(default=None, max_length=4_000)
+    actions: list[str] | None = Field(default=None, max_length=100)
+    constraints: list[str] | None = Field(default=None, max_length=100)
+    dfx: list[str] | None = Field(default=None, max_length=100)
+    affected_components: list[str] | None = Field(default=None, max_length=100)
+    lifecycle: str | None = Field(default=None, max_length=500)
+    tags: list[str] | None = Field(default=None, max_length=50)
+    source_ir_ids: list[str] | None = Field(default=None, max_length=50)
+    security_level: str | None = Field(default=None, max_length=100)
+    esn_id: str | None = Field(default=None, max_length=120)
+    topology_diagram: str | None = Field(default=None, max_length=2_000)
+    ir_intent: str | None = Field(default=None, max_length=4_000)
+    metadata: dict[str, str] | None = Field(default=None)
+
+
+class UpdateUseCaseRequest(BaseModel):
+    """Partial UC content update; parent migration uses move_use_case."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    use_case_id: str = Field(min_length=1, max_length=120)
+    name: str | None = Field(default=None, min_length=3, max_length=300)
+    description: str | None = Field(default=None, min_length=10, max_length=8_000)
+    actor: str | None = Field(default=None, min_length=1, max_length=1_000)
+    preconditions: list[str] | None = Field(default=None, max_length=100)
+    trigger_event: str | None = Field(default=None, max_length=4_000)
+    success_guarantee: str | None = Field(default=None, max_length=4_000)
+    minimum_guarantee: str | None = Field(default=None, max_length=4_000)
+    main_success_scenario: list[str] | None = Field(default=None, max_length=100)
+    extension_scenarios: list[str] | None = Field(default=None, max_length=100)
+    constraints: list[str] | None = Field(default=None, max_length=100)
+    dfx: list[str] | None = Field(default=None, max_length=100)
+    catalog: str | None = Field(default=None, max_length=1_000)
+    tags: list[str] | None = Field(default=None, max_length=50)
+    source_ir_ids: list[str] | None = Field(default=None, max_length=50)
+    security_level: str | None = Field(default=None, max_length=100)
+
+
+class TransitionRecordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    record_type: Literal["scenario", "use_case"]
+    record_id: str = Field(min_length=1, max_length=120)
+    workflow_status: WorkflowStatus
+    comment: str | None = Field(default=None, max_length=2_000)
+
+
+class MoveUseCaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    use_case_id: str = Field(min_length=1, max_length=120)
+    target_scenario_id: str = Field(min_length=1, max_length=120)
 
 
 class LinkUseCasesRequest(BaseModel):

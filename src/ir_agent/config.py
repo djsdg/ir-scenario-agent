@@ -44,6 +44,7 @@ class Settings:
     api_key: str | None
     model: str = "gpt-5.5"
     api_mode: str = "responses"
+    embedding_model: str | None = None
     base_url: str | None = None
     organization: str | None = None
     library_path: Path = Path("data/scenario_library.json")
@@ -117,6 +118,7 @@ class Settings:
             api_key=os.getenv("IR_AGENT_API_KEY") or os.getenv("OPENAI_API_KEY"),
             model=os.getenv("IR_AGENT_MODEL") or os.getenv("OPENAI_MODEL", "gpt-5.5"),
             api_mode=resolved_api_mode,
+            embedding_model=os.getenv("IR_AGENT_EMBEDDING_MODEL") or None,
             base_url=os.getenv("IR_AGENT_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None,
             organization=os.getenv("OPENAI_ORG_ID") or None,
             library_path=resolved_library_path,

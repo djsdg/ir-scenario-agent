@@ -13,10 +13,12 @@ from ir_agent.agent import (
     OpenAIChatCompletionsTransport,
     RetryingResponsesTransport,
     SessionStore,
+    _guard_resolution_facts,
     _chat_messages_from_input,
 )
 from ir_agent.audit import AuditLogger
 from ir_agent.config import Settings
+from ir_agent.domain import ScenarioResolution, ToolCallRecord
 from ir_agent.library import ScenarioLibrary
 
 
@@ -280,6 +282,66 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.usage["total_tokens"], 30)
         self.assertEqual(transport.last_request["text"]["format"]["type"], "json_schema")
         self.assertNotIn("$defs", transport.last_request["text"]["format"]["schema"])
+
+    def test_structured_resolution_cannot_invent_tool_ids(self) -> None:
+        resolution = ScenarioResolution(
+            status="matched",
+            decision="reuse_scenario_and_uc",
+            ir_id=None,
+            request_summary="测试",
+            candidates=[],
+            selected_scenario_ids=["SCN-FAKE"],
+            use_case_ids=["UC-FAKE"],
+            created_scenario_id=None,
+            created_use_case_ids=[],
+            confidence=0.9,
+            missing_required_fields=[],
+            gaps=[],
+            next_steps=[],
+        )
+        records = [
+            ToolCallRecord(
+                name="match_scenario",
+                arguments={},
+                result={"matches": [{"scenario": {"id": "SCN-REAL"}}]},
+            )
+        ]
+
+        guarded = _guard_resolution_facts(resolution, records)
+
+        self.assertIsNotNone(guarded)
+        self.assertEqual(guarded.decision, "needs_clarification")
+        self.assertEqual(guarded.selected_scenario_ids, [])
+        self.assertEqual(guarded.use_case_ids, [])
+        self.assertTrue(any("选中 SC 编号" in item for item in guarded.gaps))
+
+    def test_structured_resolution_is_checked_against_library_without_tool_calls(self) -> None:
+        resolution = ScenarioResolution(
+            status="matched",
+            decision="reuse_scenario_and_uc",
+            ir_id=None,
+            request_summary="测试",
+            candidates=[],
+            selected_scenario_ids=["SCN-FAKE"],
+            use_case_ids=[],
+            created_scenario_id=None,
+            created_use_case_ids=[],
+            confidence=0.9,
+            missing_required_fields=[],
+            gaps=[],
+            next_steps=[],
+        )
+
+        guarded = _guard_resolution_facts(
+            resolution,
+            [],
+            known_scenario_ids={item.id for item in self.library.list_scenarios()},
+            known_use_case_ids={item.id for item in self.library.list_use_cases()},
+        )
+
+        self.assertIsNotNone(guarded)
+        self.assertEqual(guarded.decision, "needs_clarification")
+        self.assertEqual(guarded.selected_scenario_ids, [])
 
     def test_context_compaction_is_used_before_request(self) -> None:
         transport = CompactingTransport()
