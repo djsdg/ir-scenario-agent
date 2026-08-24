@@ -149,6 +149,7 @@ class ScenarioMatch(BaseModel):
     scenario: Scenario
     score: float = Field(ge=0.0, le=1.0)
     matched_terms: list[str] = Field(default_factory=list)
+    matched_fields: dict[str, list[str]] = Field(default_factory=dict)
     matched_dimensions: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
@@ -160,6 +161,8 @@ class UseCaseMatch(BaseModel):
     use_case: UseCase
     score: float = Field(ge=0.0, le=1.0)
     matched_terms: list[str] = Field(default_factory=list)
+    matched_fields: dict[str, list[str]] = Field(default_factory=dict)
+    parent_scenario_id: str | None = None
 
 
 class IRMatchResult(BaseModel):

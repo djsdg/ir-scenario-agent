@@ -7,10 +7,8 @@ import sys
 import threading
 import webbrowser
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from .agent import (
     AgentRunError,
@@ -29,6 +27,7 @@ from .mcp import MCPConfig
 from .memory import MemoryStore
 from .plugins import PluginContext, PluginLoadReport, PluginManager
 from .retrieval import OpenAIEmbeddingProvider
+from .reporting import build_analysis_report, save_run_report
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
 from .tools import ToolRegistry
@@ -155,7 +154,6 @@ try:
         Input,
         DataTable,
         Label,
-        RichLog,
         Static,
         TabbedContent,
         TabPane,
@@ -168,6 +166,26 @@ else:
 
 
 if _TEXTUAL_IMPORT_ERROR is None:
+
+    class _CopyableTextArea(TextArea):
+        """Read-only output area with native mouse selection and Ctrl+C support."""
+
+        def __init__(self, text: str = "", **kwargs: Any):
+            kwargs.setdefault("read_only", True)
+            kwargs.setdefault("soft_wrap", True)
+            kwargs.setdefault("show_line_numbers", False)
+            super().__init__(text=text, **kwargs)
+
+        def write(self, value: object) -> None:
+            rendered = str(value)
+            if not rendered:
+                return
+            self.text = f"{self.text}\n{rendered}" if self.text else rendered
+            self.scroll_end(animate=False)
+
+        def update(self, content: object = "") -> _CopyableTextArea:
+            self.text = str(content)
+            return self
 
     def _format_approval_request(request: dict[str, object]) -> str:
         """Render an approval request as a readable write preview."""
@@ -233,7 +251,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             details = _format_approval_request(self.request)
             with Container(id="approval-dialog"):
                 yield Label(f"{self.title_text} 请求授权", id="approval-title")
-                yield Static(details, id="approval-details")
+                yield _CopyableTextArea(details, id="approval-details")
                 with Horizontal(id="approval-buttons"):
                     yield Button("允许", id="approve", variant="success")
                     yield Button("拒绝", id="deny", variant="error")
@@ -287,6 +305,11 @@ if _TEXTUAL_IMPORT_ERROR is None:
             border: round $primary;
             padding: 0 1;
             scrollbar-size: 1 1;
+        }
+        #copy-hint {
+            height: 1;
+            color: $text-muted;
+            padding: 0 1;
         }
         #result-tabs {
             height: 1fr;
@@ -445,12 +468,12 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self.session_store = runtime.session_store
 
         @property
-        def conversation(self) -> RichLog:
-            return self.query_one("#conversation", RichLog)
+        def conversation(self) -> _CopyableTextArea:
+            return self.query_one("#conversation", _CopyableTextArea)
 
         @property
-        def candidates_log(self) -> RichLog:
-            return self.query_one("#candidates", RichLog)
+        def candidates_log(self) -> _CopyableTextArea:
+            return self.query_one("#candidates", _CopyableTextArea)
 
         @property
         def candidate_table(self) -> DataTable:
@@ -461,8 +484,8 @@ if _TEXTUAL_IMPORT_ERROR is None:
             return self.query_one("#use-case-table", DataTable)
 
         @property
-        def tools_log(self) -> RichLog:
-            return self.query_one("#tools", RichLog)
+        def tools_log(self) -> _CopyableTextArea:
+            return self.query_one("#tools", _CopyableTextArea)
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -492,36 +515,43 @@ if _TEXTUAL_IMPORT_ERROR is None:
                             placeholder="粘贴 IR/SC/UC，或描述你的需求。Ctrl+Enter 发送。",
                             id="prompt",
                         )
-                        yield Static("尚未提交输入。发送后原文会保留在这里。", id="input-meta")
+                        yield _CopyableTextArea(
+                            "尚未提交输入。发送后原文会保留在这里。",
+                            id="input-meta",
+                        )
                         with Horizontal(id="input-actions"):
                             yield Button("发送", id="send", variant="primary")
                             yield Button("清空输入", id="clear-input")
                             yield Button("退出", id="quit", variant="error")
                     with Vertical(id="output-panel"):
                         yield Static("Agent 输出", classes="panel-title")
+                        yield Static("输出区支持鼠标选中；Ctrl+C 复制，Ctrl+A 全选", id="copy-hint")
                         with TabbedContent(initial="conversation-tab", id="result-tabs"):
                             with TabPane("对话", id="conversation-tab"):
-                                yield RichLog(id="conversation", wrap=True, markup=False)
+                                yield _CopyableTextArea(id="conversation")
                             with TabPane("候选对比", id="candidates-tab"):
                                 yield Static("SC 候选", classes="comparison-title")
                                 yield DataTable(id="candidate-table", cursor_type="row")
                                 yield Static("UC 候选（按父 SC 过滤）", classes="comparison-title")
                                 yield DataTable(id="use-case-table", cursor_type="row")
-                                yield Static("尚未选择候选。点击表格行后加入选择。", id="selection-summary")
+                                yield _CopyableTextArea(
+                                    "尚未选择候选。点击表格行后加入选择。",
+                                    id="selection-summary",
+                                )
                                 with Horizontal(id="candidate-actions"):
                                     yield Button("加入当前选择", id="add-selection", variant="primary")
                                     yield Button("填充确认/编辑提示", id="prepare-selection")
                                     yield Button("确认选择并发送", id="confirm-selection", variant="success")
                                     yield Button("检查库质量", id="validate-library")
                                     yield Button("清空选择", id="clear-selection")
-                                yield RichLog(id="candidates", wrap=True, markup=False)
+                                yield _CopyableTextArea(id="candidates")
                             with TabPane("工具日志", id="tools-tab"):
-                                yield RichLog(id="tools", wrap=True, markup=False)
+                                yield _CopyableTextArea(id="tools")
                 with Vertical(id="side"):
                     yield Static("状态：启动中", id="status")
-                    yield Static("配置", id="config")
-                    yield Static("路径", id="paths")
-                    yield Static("暂无结果", id="result-summary")
+                    yield _CopyableTextArea("配置", id="config")
+                    yield _CopyableTextArea("路径", id="paths")
+                    yield _CopyableTextArea("暂无结果", id="result-summary")
                     with Horizontal(id="result-actions"):
                         yield Button("打开输出目录", id="open-output", disabled=True)
                         yield Button("打开结果文件", id="open-result", disabled=True)
@@ -560,7 +590,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         f"歧义分差：{self._rule_number(matching_rules, 'ambiguity_margin', 0.08):.2f}",
                     ]
                 )
-            self.query_one("#config", Static).update("\n".join(config_lines))
+            self.query_one("#config", _CopyableTextArea).update("\n".join(config_lines))
             path_lines = [
                 f"场景库：{self.agent.library.path.resolve()}",
                 f"UC 库：{uc_library_path.resolve() if uc_library_path else '与场景库同文件'}",
@@ -568,7 +598,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 f"输出：{self.settings.outputs_dir.resolve()}",
                 f"审计：{self.settings.audit_path.resolve()}",
             ]
-            self.query_one("#paths", Static).update("\n".join(path_lines))
+            self.query_one("#paths", _CopyableTextArea).update("\n".join(path_lines))
             library_input = self.query_one("#library-path", Input)
             library_input.value = str(self.settings.library_path.resolve())
             if self.initial_source:
@@ -645,7 +675,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self._reset_candidate_table()
             self.tools_log.clear()
             self.conversation.write("系统：对话显示已清空，会话上下文仍保留。")
-            self.query_one("#result-summary", Static).update("暂无结果")
+            self.query_one("#result-summary", _CopyableTextArea).update("暂无结果")
             self._last_output_path = None
             self.query_one("#open-output", Button).disabled = True
             self.query_one("#open-result", Button).disabled = True
@@ -700,7 +730,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             selected_sc = "、".join(self._selected_scenario_ids) or "无"
             selected_uc = "、".join(self._selected_use_case_ids) or "无"
             current = self._current_scenario_id or self._current_use_case_id or "无"
-            self.query_one("#selection-summary", Static).update(
+            self.query_one("#selection-summary", _CopyableTextArea).update(
                 f"当前行：{current}\n已选 SC：{selected_sc}\n已选 UC：{selected_uc}"
             )
 
@@ -759,7 +789,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 f"IR：{counts.get('requirements', 0)}  SC：{counts.get('scenarios', 0)}  UC：{counts.get('use_cases', 0)}",
                 f"问题：{counts.get('issues', len(issues))}  警告：{counts.get('warnings', len(warnings))}",
             ]
-            self.query_one("#result-summary", Static).update("\n".join(summary))
+            self.query_one("#result-summary", _CopyableTextArea).update("\n".join(summary))
             self.conversation.write("库质量审计：\n" + "\n".join(summary))
             self.tools_log.write(
                 f"✓ validate_library（问题 {len(issues)}，警告 {len(warnings)}）"
@@ -959,7 +989,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self.runtime.session = self.session
 
             uc_library_path = library.use_case_path
-            self.query_one("#paths", Static).update(
+            self.query_one("#paths", _CopyableTextArea).update(
                 "\n".join(
                     [
                         f"场景库：{library.path.resolve()}",
@@ -1033,10 +1063,14 @@ if _TEXTUAL_IMPORT_ERROR is None:
 
         def _write_result(self, result: Any, output_path: Path | None) -> None:
             resolution = result.resolution
+            report = build_analysis_report(
+                result,
+                self.agent.library if self.agent is not None else None,
+            )
             self.candidates_log.clear()
             self._reset_candidate_table()
             if resolution is None:
-                self.query_one("#result-summary", Static).update(
+                self.query_one("#result-summary", _CopyableTextArea).update(
                     "本轮返回非结构化文本\n"
                     + (f"输出：{output_path}" if output_path else "输出文件保存失败")
                 )
@@ -1054,12 +1088,34 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         for item in resolution.candidates
                     )
                     lines.append(f"候选场景：{candidates}")
+                scenario_evidence = report.get("scenarios", {}).get("matches", [])
+                if scenario_evidence:
+                    lines.append("SC 匹配依据：")
+                    for item in scenario_evidence:
+                        lines.append(
+                            f"- {item['id']}：{self._format_match_fields(item.get('matched_fields'))}"
+                        )
                 if resolution.selected_scenario_ids:
                     lines.append(
                         f"选中场景：{', '.join(resolution.selected_scenario_ids)}"
                     )
                 if resolution.use_case_ids:
                     lines.append(f"Use case：{', '.join(resolution.use_case_ids)}")
+                use_case_evidence = report.get("use_cases", {}).get("matches", [])
+                if use_case_evidence:
+                    lines.append("UC 匹配依据：")
+                    for item in use_case_evidence:
+                        parent = item.get("parent_scenario_id") or "父 SC 未解析"
+                        lines.append(
+                            f"- {item['id']}（父 SC：{parent}）："
+                            f"{self._format_match_fields(item.get('matched_fields'))}"
+                        )
+                for relationship in report.get("use_cases", {}).get("by_scenario", []):
+                    lines.append(
+                        f"SC→UC：{relationship['scenario_id']} "
+                        f"{relationship['scenario_name']} -> "
+                        f"{', '.join(relationship.get('use_case_ids', [])) or '暂无 UC'}"
+                    )
                 if resolution.created_scenario_id:
                     lines.append(f"新建场景：{resolution.created_scenario_id}")
                 if resolution.created_use_case_ids:
@@ -1075,6 +1131,14 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     lines.append("缺口：" + "；".join(resolution.gaps))
                 if resolution.next_steps:
                     lines.append("下一步：" + "；".join(resolution.next_steps))
+                if report.get("writes"):
+                    lines.append(
+                        "库更新："
+                        + "、".join(
+                            f"{item.get('action')} {item.get('id')}"
+                            for item in report["writes"]
+                        )
+                    )
                 self.conversation.write("Agent：\n" + "\n".join(lines))
 
                 summary_lines = [
@@ -1099,9 +1163,14 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     )
                 if resolution.use_case_ids:
                     summary_lines.append("UC：" + ", ".join(resolution.use_case_ids))
+                for relationship in report.get("use_cases", {}).get("by_scenario", []):
+                    summary_lines.append(
+                        f"{relationship['scenario_id']} 子 UC："
+                        f"{', '.join(relationship.get('use_case_ids', [])) or '暂无'}"
+                    )
                 if output_path:
                     summary_lines.append(f"输出：{output_path}")
-                self.query_one("#result-summary", Static).update("\n".join(summary_lines))
+                self.query_one("#result-summary", _CopyableTextArea).update("\n".join(summary_lines))
 
                 if not resolution.candidates:
                     self.candidates_log.write("模型没有返回结构化候选场景。")
@@ -1126,6 +1195,15 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     if candidate.matched_dimensions:
                         self.candidates_log.write(
                             "   命中：" + "、".join(candidate.matched_dimensions)
+                        )
+                    matched_fields = details.get("matched_fields", {})
+                    if matched_fields:
+                        self.candidates_log.write(
+                            "   命中字段：" + self._format_match_fields(matched_fields)
+                        )
+                    if details.get("matched_terms"):
+                        self.candidates_log.write(
+                            "   命中词：" + "、".join(details["matched_terms"])
                         )
                     if candidate.gaps:
                         self.candidates_log.write("   缺口：" + "；".join(candidate.gaps))
@@ -1160,36 +1238,26 @@ if _TEXTUAL_IMPORT_ERROR is None:
             use_case_table.add_columns("序号", "UC", "用例名称", "分数", "父 SC", "命中词")
 
         def _write_use_case_candidates(self, result: Any) -> None:
-            raw_matches: list[dict[str, Any]] = []
-            for call in result.tool_calls:
-                payload: object = {}
-                if call.name == "match_ir_requirement":
-                    match_payload = call.result.get("match")
-                    if isinstance(match_payload, dict):
-                        payload = match_payload.get("use_case_matches", [])
-                elif call.name == "match_use_case":
-                    payload = call.result.get("matches", [])
-                if isinstance(payload, list):
-                    raw_matches.extend(
-                        item for item in payload if isinstance(item, dict)
-                    )
-
+            report = build_analysis_report(
+                result,
+                self.agent.library if self.agent is not None else None,
+            )
+            raw_matches = report.get("use_cases", {}).get("matches", [])
             seen: set[str] = set()
             rows: list[tuple[str, str, str, str, str]] = []
             for item in raw_matches:
-                use_case = item.get("use_case")
-                if not isinstance(use_case, dict) or not use_case.get("id"):
+                if not isinstance(item, dict) or not item.get("id"):
                     continue
-                use_case_id = str(use_case["id"])
+                use_case_id = str(item["id"])
                 if use_case_id in seen:
                     continue
                 seen.add(use_case_id)
-                parent_id = str(use_case.get("scenario_id") or "-")
+                parent_id = str(item.get("parent_scenario_id") or "-")
                 matched_terms = item.get("matched_terms", [])
                 rows.append(
                     (
                         use_case_id,
-                        str(use_case.get("name") or use_case_id),
+                        str(item.get("name") or use_case_id),
                         f"{float(item.get('score', 0.0) or 0.0):.2f}",
                         parent_id,
                         self._clip("、".join(str(value) for value in matched_terms) or "-"),
@@ -1230,6 +1298,13 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         "conflicts": [
                             str(value) for value in item.get("conflicts", [])
                         ],
+                        "matched_fields": {
+                            str(key): [str(value) for value in values]
+                            for key, values in (item.get("matched_fields") or {}).items()
+                        },
+                        "matched_terms": [
+                            str(value) for value in item.get("matched_terms", [])
+                        ],
                     }
             return details
 
@@ -1253,46 +1328,35 @@ if _TEXTUAL_IMPORT_ERROR is None:
         def _clip(value: str, limit: int = 42) -> str:
             return value if len(value) <= limit else value[: limit - 1] + "…"
 
+        @staticmethod
+        def _format_match_fields(fields: object) -> str:
+            if not isinstance(fields, dict) or not fields:
+                return "无字段级命中证据"
+            parts = []
+            for key, values in fields.items():
+                terms = values if isinstance(values, list) else [values]
+                parts.append(f"{key}[{'、'.join(str(value) for value in terms)}]")
+            return "；".join(parts)
+
         def _save_result(self, result: Any) -> Path | None:
             if self.settings is None or self.session is None:
                 return None
             try:
-                output_root = self.settings.outputs_dir / self.session.id
-                output_root.mkdir(parents=True, exist_ok=True)
-                timestamp = datetime.now(timezone.utc).astimezone().strftime(
-                    "%Y%m%d_%H%M%S"
+                return save_run_report(
+                    result,
+                    self.settings.outputs_dir,
+                    session_id=self.session.id,
+                    input_text=self._active_input,
+                    input_source=self._active_input_source,
+                    library=self.agent.library if self.agent is not None else None,
+                    spec_path=self.settings.spec_path,
                 )
-                output_path = output_root / f"{timestamp}_{uuid4().hex[:8]}.json"
-                payload = {
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "session_id": self.session.id,
-                    "input": self._active_input,
-                    "input_source": self._active_input_source,
-                    "library_path": (
-                        str(self.agent.library.path.resolve())
-                        if self.agent is not None
-                        else None
-                    ),
-                    "uc_library_path": (
-                        str(self.agent.library.use_case_path.resolve())
-                        if self.agent is not None
-                        and self.agent.library.use_case_path is not None
-                        else None
-                    ),
-                    "spec_path": str(self.settings.spec_path.resolve()),
-                    "result": result.model_dump(mode="json"),
-                }
-                output_path.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                return output_path.resolve()
             except Exception as exc:
                 self.tools_log.write(f"结果文件保存失败：{exc}")
                 return None
 
         def _set_input_meta(self, text: str) -> None:
-            self.query_one("#input-meta", Static).update(text)
+            self.query_one("#input-meta", _CopyableTextArea).update(text)
 
         def _open_result_path(self, path: Path | None) -> None:
             if path is None:

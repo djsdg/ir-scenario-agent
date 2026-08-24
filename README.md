@@ -27,7 +27,7 @@
   - `move_use_case`：迁移 UC 的唯一父 SC，并同步更新两侧 revision。
 - 匹配结果区分四种决策：复用场景和 UC、复用场景但新增 UC、新增场景和 UC、信息不足待澄清。
 - 完整 IR 匹配会返回候选分差和硬冲突；Actor、生命周期、影响部件或范围明确冲突，或最高/次高候选过于接近时，会转为人工澄清，避免误复用。
-- 匹配保留中文单字、二/三字短语和 How Much/DFX 证据；Actor、上下文、影响因素等关键维度未覆盖时，即使总分较高也不会自动复用。
+- 匹配保留中文单字、二/三字短语和 How Much/DFX 证据，并按字段返回命中证据，例如 `Actor[本系统]`、`影响因素[部件/节点]`、`主成功场景[检测/隔离]`；Actor、上下文、影响因素等关键维度未覆盖时，即使总分较高也不会自动复用。
 - 完整 IR 使用 `match_ir_requirement`；单独维护 SC/UC 时分别使用 `match_scenario`/`match_use_case`。独立匹配是只读建议，实际新建仍需调用对应写入工具并经过审批。
 - 支持一个 IR 返回多个场景候选、一个 SC 关联多个 UC；每个 UC 只能归属一个父 SC。新增时按单个 SC/UC 草稿分别审批，避免把独立行为链强行合并。
 - 使用 `config/ir_sc_uc_spec.json` 约束 IR→SC→UC 映射、场景类别/状态、六类影响因素维度和质量输出；不把 IR 直接当 SC。
@@ -42,7 +42,7 @@
 - agent 自己管理 Responses API 的工具调用循环，支持一轮返回多个工具调用。
 - 本地工具、审批、审计和场景库逻辑与模型供应商解耦；Chat Completions 模式下远程 MCP 不启用，插件和本地 function tools 仍可用。
 - 提供可选 Textual TUI：多行粘贴 IR/SC/UC、后台执行模型请求、显示匹配结果/工具调用，并支持写入与 MCP 授权弹窗。
-- TUI 的 IR 文档和场景库读取在后台任务执行；切换场景库时会隔离旧会话上下文，结果 JSON 同时记录输入来源、SC/UC 库和 Spec 路径。
+- TUI 的 IR 文档和场景库读取在后台任务执行；切换场景库时会隔离旧会话上下文。对话、匹配详情、工具日志、路径和结果摘要均为只读可选中文本区，支持鼠标拖选、`Ctrl+C` 复制和 `Ctrl+A` 全选。每轮结果会保存为一个独立目录，包含总结果、Markdown 报告，以及分开的 `scenarios/` 和 `use_cases/` 子目录；其中 `use_cases/by_scenario/` 按父 SC 保存多个 UC 的关系快照。
 - Responses 模式使用严格 JSON Schema；Chat Completions 模式使用 JSON mode 并由 Pydantic 做最终校验，方便后续 Web/API 消费；CLI 默认把它渲染成人类可读摘要。
 - 最终结构化结果会再次对照当前场景库和工具返回的真实 ID；如果模型输出了不存在或未由写入工具产生的 SC/UC 编号，会自动降级为待澄清，不把模型文本当成事实。
 - 场景库和记忆写入工具默认需要应用层人工批准；批准、拒绝、耗时和结果会写入 JSONL 审计日志。
@@ -51,6 +51,43 @@
 - 场景库也支持 SQLite：将 `IR_AGENT_LIBRARY_PATH` 或 `--library` 指向 `.sqlite3/.sqlite/.db` 即启用 WAL、事务写入和过期快照保护。
 - 会话上下文可落盘到 `data/sessions/`，默认 `store=False`，不依赖服务端线程状态。
 - 工具参数和领域对象使用 Pydantic 校验，减少模型生成脏数据的影响。
+
+### 匹配解释和输出目录
+
+匹配成功时，CLI/TUI 会分别展示：
+
+- SC 命中了哪些字段：目标/行为、Actor、上下文、影响因素、约束等；
+- UC 命中了哪些字段：前置条件、触发事件、主成功场景、成功保证、DFX 等；
+- 每个 UC 的父 SC，以及一个 SC 下的多个 UC；
+- 缺口和冲突，而不是只显示一个分数。
+
+一次运行的输出目录结构类似：
+
+```text
+data/outputs/<session_id>/<timestamp>_<id>/
+├── result.json
+├── report.json
+├── report.md
+├── manifest.json
+├── scenarios/
+│   ├── matches.json
+│   ├── selected.json
+│   ├── created.json
+│   └── updated.json
+└── use_cases/
+    ├── matches.json
+    ├── selected.json
+    ├── created.json
+    ├── updated.json
+    └── by_scenario/
+        └── SCN-XXXX-001.json
+```
+
+如果用户明确要求“新增场景/UC”或“更新场景/UC”，并通过审批，写入工具会直接更新原场景库；上述输出目录保存的是本轮分析和写入后的快照，不会替代原库。CLI 可以指定输出根目录：
+
+```powershell
+ir-agent --input-file .\examples\ir_sanitized.txt --output-dir .\data\outputs
+```
 
 ## 快速开始
 

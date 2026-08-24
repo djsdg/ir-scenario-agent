@@ -151,8 +151,8 @@ match_ir_requirement
 
 它会同时匹配 SC 和 UC，并返回：
 
-- `scenario_matches`：候选 SC、分数、命中词、命中维度、未覆盖维度；
-- `use_case_matches`：选中候选 SC 的子 UC、分数、命中词；如果没有 SC 候选，才回退到全库 UC 候选；
+- `scenario_matches`：候选 SC、分数、命中词、字段级命中证据、命中维度、未覆盖维度和冲突；
+- `use_case_matches`：选中候选 SC 的子 UC、分数、字段级命中证据和父 SC；如果没有 SC 候选，才回退到全库 UC 候选；
 - `decision`：复用/新增/待澄清；
 - `confidence`：最高候选 SC 分数；
 - `score_margin`：最高和次高 SC 候选的分差；
@@ -355,6 +355,23 @@ Constraints: 只监控 IO 进程；事后检测；数据修复不在范围；可
 - 如果部件类型、生命周期、Actor 或影响因素完全不同：新增 SC，再新增 UC。
 
 这里“复用 SC、增加 UC”是有意的拆分：SC 表示稳定的业务/系统上下文，UC 表示该 SC 下的具体行为分支。UC 不能被其他 SC 共享；如果另一场景需要类似行为，应创建该场景自己的 UC。
+
+### 7.1 匹配解释和结果快照
+
+系统不会只输出一个相似度分数。SC 匹配会把证据分组到目标/行为、Actor、上下文、影响因素和约束；UC 匹配会把证据分组到前置条件、触发事件、主成功场景、成功保证、最小保证和 DFX。这样人工可以判断“为什么命中”，而不是盲目接受分数。
+
+每轮 CLI/TUI 运行会保存一个结果目录：
+
+```text
+<output>/<session>/<run>/
+├── result.json       # 完整 AgentResult 和报告
+├── report.json       # 机器可读的 SC/UC 分层报告
+├── report.md         # 人工阅读报告
+├── scenarios/        # SC 命中、选中、新建、更新快照
+└── use_cases/        # UC 命中、选中、新建、更新和按父 SC 分组快照
+```
+
+一个 SC 下的多个 UC 会在 `use_cases/by_scenario/<SC-ID>.json` 中逐项列出。若用户明确要求新增或更新并通过审批，写入工具会修改原场景库；结果目录是本轮操作的证据快照，不能替代原库。
 
 ## 8. 写入、审批和追溯
 

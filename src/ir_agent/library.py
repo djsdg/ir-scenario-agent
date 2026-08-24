@@ -299,6 +299,87 @@ def _coverage(
     return (matched_weight / total_weight if total_weight else 0.0), matched
 
 
+def _field_evidence(
+    query: str,
+    fields: list[tuple[str, str]],
+    *,
+    synonyms: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, list[str]]:
+    """Return explainable query-term evidence grouped by record field."""
+
+    evidence: dict[str, list[str]] = {}
+    for label, value in fields:
+        if not value.strip():
+            continue
+        _score, matched = _coverage(query, value, synonyms=synonyms)
+        if matched:
+            evidence[label] = sorted(matched)
+    return evidence
+
+
+def _scenario_field_evidence(
+    query: str,
+    scenario: Scenario,
+    *,
+    synonyms: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, list[str]]:
+    return _field_evidence(
+        query,
+        [
+            ("名称", scenario.name),
+            ("描述", scenario.description),
+            ("业务目标", scenario.business_goal or ""),
+            ("Actor", scenario.actor),
+            ("生命周期", scenario.lifecycle or ""),
+            ("活动", " ".join(scenario.actions)),
+            (
+                "影响因素",
+                " ".join(
+                    [
+                        factor.name
+                        for factor in scenario.influence_factors
+                    ]
+                    + [
+                        value
+                        for factor in scenario.influence_factors
+                        for value in factor.selected_values
+                    ]
+                ),
+            ),
+            ("影响部件", " ".join(scenario.affected_components)),
+            ("约束", " ".join(scenario.constraints)),
+            ("标签", " ".join(scenario.tags)),
+        ],
+        synonyms=synonyms,
+    )
+
+
+def _use_case_field_evidence(
+    query: str,
+    use_case: UseCase,
+    *,
+    synonyms: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, list[str]]:
+    return _field_evidence(
+        query,
+        [
+            ("名称", use_case.name),
+            ("描述", use_case.description),
+            ("Actor", use_case.actor),
+            ("前置条件", " ".join(use_case.preconditions)),
+            ("触发事件", use_case.trigger_event),
+            ("成功保证", use_case.success_guarantee),
+            ("最小保证", use_case.minimum_guarantee),
+            ("主成功场景", " ".join(use_case.main_success_scenario)),
+            ("扩展场景", " ".join(use_case.extension_scenarios)),
+            ("约束", " ".join(use_case.constraints)),
+            ("DFX", " ".join(use_case.dfx)),
+            ("标签", " ".join(use_case.tags)),
+        ],
+        synonyms=synonyms,
+    )
+
+
 def _hybrid_scores(
     query: str,
     documents: list[str],
@@ -713,6 +794,11 @@ class ScenarioLibrary:
                         scenario=scenario,
                         score=round(score, 4),
                         matched_terms=sorted(matched),
+                        matched_fields=_scenario_field_evidence(
+                            query,
+                            scenario,
+                            synonyms=synonyms,
+                        ),
                     )
                 )
 
@@ -743,6 +829,10 @@ class ScenarioLibrary:
         tfidf_weight = _configured_weight(rules, "tfidf_weight", 0.25)
         embedding_weight = _configured_weight(rules, "embedding_weight", 0.20)
         use_cases = self.list_use_cases()
+        parent_by_use_case: dict[str, str] = {}
+        for scenario in self.list_scenarios():
+            for use_case_id in scenario.use_case_ids:
+                parent_by_use_case.setdefault(use_case_id, scenario.id)
         searchable_documents = [
             " ".join(
                 [
@@ -785,6 +875,12 @@ class ScenarioLibrary:
                         use_case=use_case,
                         score=round(score, 4),
                         matched_terms=sorted(matched),
+                        matched_fields=_use_case_field_evidence(
+                            query,
+                            use_case,
+                            synonyms=synonyms,
+                        ),
+                        parent_scenario_id=scenario_id or parent_by_use_case.get(use_case.id),
                     )
                 )
         matches.sort(key=lambda item: (-item.score, item.use_case.name))
@@ -915,6 +1011,17 @@ class ScenarioLibrary:
                     scenario=scenario,
                     score=round(score, 4),
                     matched_terms=sorted(matched_terms),
+                    matched_fields={
+                        label: sorted(terms)
+                        for label, terms in {
+                            "目标/行为": intent_terms,
+                            "Actor": actor_terms,
+                            "上下文": context_terms,
+                            "影响因素": impact_terms,
+                            "约束": constraint_terms,
+                        }.items()
+                        if terms
+                    },
                     matched_dimensions=dimensions,
                     gaps=gaps,
                     conflicts=conflicts,

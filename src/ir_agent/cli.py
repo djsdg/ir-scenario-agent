@@ -23,6 +23,7 @@ from .mcp import MCPConfig
 from .memory import MemoryStore
 from .plugins import PluginContext, PluginManager
 from .retrieval import OpenAIEmbeddingProvider
+from .reporting import build_analysis_report, save_run_report
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
 from .sqlite_library import migrate_json_to_sqlite
@@ -76,6 +77,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the machine-readable final JSON instead of the human summary",
     )
     parser.add_argument(
+        "--output-dir",
+        help="Save each run into a report directory containing scenarios/ and use_cases/",
+    )
+    parser.add_argument(
         "--no-session-save",
         action="store_true",
         help="Do not load or save the local JSON session",
@@ -94,9 +99,26 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _print_result(result, *, show_tools: bool, json_output: bool) -> None:
+def _format_match_fields(fields: object) -> str:
+    if not isinstance(fields, dict) or not fields:
+        return "无字段级命中证据"
+    parts = []
+    for key, values in fields.items():
+        terms = values if isinstance(values, list) else [values]
+        parts.append(f"{key}[{'、'.join(str(value) for value in terms)}]")
+    return "；".join(parts)
+
+
+def _print_result(
+    result,
+    *,
+    show_tools: bool,
+    json_output: bool,
+    library=None,
+) -> None:
     if result.resolution is not None and not json_output:
         resolution = result.resolution
+        report = build_analysis_report(result, library)
         print(f"状态：{resolution.status}")
         print(f"决策：{resolution.decision}")
         if resolution.ir_id:
@@ -107,10 +129,31 @@ def _print_result(result, *, show_tools: bool, json_output: bool) -> None:
                 f"{item.scenario_id}({item.score:.2f})" for item in resolution.candidates
             )
             print(f"候选场景：{candidates}")
+        for item in report.get("scenarios", {}).get("matches", []):
+            print(
+                f"SC匹配依据：{item['id']} {item['name']} -> "
+                f"{_format_match_fields(item.get('matched_fields'))}"
+            )
+            if item.get("gaps"):
+                print(f"  未覆盖：{'；'.join(item['gaps'])}")
+            if item.get("conflicts"):
+                print(f"  冲突：{'；'.join(item['conflicts'])}")
         if resolution.selected_scenario_ids:
             print(f"选中场景：{', '.join(resolution.selected_scenario_ids)}")
         if resolution.use_case_ids:
             print(f"Use case：{', '.join(resolution.use_case_ids)}")
+        for item in report.get("use_cases", {}).get("matches", []):
+            print(
+                f"UC匹配依据：{item['id']} {item['name']} "
+                f"（父 SC：{item.get('parent_scenario_id') or '未解析'}） -> "
+                f"{_format_match_fields(item.get('matched_fields'))}"
+            )
+        for relationship in report.get("use_cases", {}).get("by_scenario", []):
+            print(
+                f"SC→UC：{relationship['scenario_id']} "
+                f"{relationship['scenario_name']} -> "
+                f"{', '.join(relationship.get('use_case_ids', [])) or '暂无 UC'}"
+            )
         if resolution.created_scenario_id:
             print(f"新建场景：{resolution.created_scenario_id}")
         if resolution.created_use_case_ids:
@@ -122,6 +165,14 @@ def _print_result(result, *, show_tools: bool, json_output: bool) -> None:
             print(f"缺口：{'；'.join(resolution.gaps)}")
         if resolution.next_steps:
             print(f"下一步：{'；'.join(resolution.next_steps)}")
+        if report.get("writes"):
+            print(
+                "库已更新："
+                + "、".join(
+                    f"{item.get('action')} {item.get('id')}"
+                    for item in report["writes"]
+                )
+            )
     else:
         print(result.output_text)
     if show_tools and result.tool_calls:
@@ -170,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         mcp_config_path=args.mcp_config,
         audit_path=args.audit_path,
         user_id=args.user_id,
+        outputs_dir=args.output_dir,
     )
 
     if args.migrate_to_sqlite:
@@ -296,7 +348,28 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # CLI boundary: make API errors readable.
             print(f"请求失败：{exc}", file=sys.stderr)
             return
-        _print_result(result, show_tools=args.show_tools, json_output=args.json_output)
+        _print_result(
+            result,
+            show_tools=args.show_tools,
+            json_output=args.json_output,
+            library=library,
+        )
+        try:
+            output_path = save_run_report(
+                result,
+                settings.outputs_dir,
+                session_id=session.id,
+                input_text=message,
+                input_source="CLI",
+                library=library,
+                spec_path=settings.spec_path,
+            )
+            if args.json_output:
+                print(f"结果目录：{output_path.parent}", file=sys.stderr)
+            else:
+                print(f"结果目录：{output_path.parent}")
+        except OSError as exc:
+            print(f"结果报告保存失败：{exc}", file=sys.stderr)
         if session_store is not None:
             session_store.save(session)
 

@@ -131,9 +131,17 @@ class ScenarioLibraryTests(unittest.TestCase):
         )
         self.assertIn(result.scenario_matches[0].scenario.id, {"SCN-XXXX-001", "SCN-XXXX-002"})
         self.assertIn("Actor", result.scenario_matches[0].matched_dimensions)
+        self.assertIn("Actor", result.scenario_matches[0].matched_fields)
+        self.assertTrue(result.scenario_matches[0].matched_fields["Actor"])
         self.assertTrue(
             all(
                 item.use_case.id in result.scenario_matches[0].scenario.use_case_ids
+                for item in result.use_case_matches
+            )
+        )
+        self.assertTrue(
+            all(
+                item.parent_scenario_id == result.scenario_matches[0].scenario.id
                 for item in result.use_case_matches
             )
         )
