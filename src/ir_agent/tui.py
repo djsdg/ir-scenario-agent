@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
+import webbrowser
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +30,7 @@ from .memory import MemoryStore
 from .plugins import PluginContext, PluginLoadReport, PluginManager
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
+from .tools import ToolRegistry
 
 
 def _load_dotenv() -> None:
@@ -42,7 +45,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="IR scenario-library Textual TUI")
     parser.add_argument("--message", help="启动后自动发送一条消息")
     parser.add_argument(
+        "--ir-path",
         "--input-file",
+        dest="input_file",
         help="启动后读取并发送 IR/SC/UC 文档（.txt/.md/.json/.docx/.pdf）",
     )
     parser.add_argument("--session-id", default="default", help="本地会话 id")
@@ -142,7 +147,19 @@ try:
     from textual.app import App, ComposeResult
     from textual.containers import Container, Horizontal, Vertical
     from textual.screen import ModalScreen
-    from textual.widgets import Button, Footer, Header, Label, RichLog, Static, TextArea
+    from textual.widgets import (
+        Button,
+        Footer,
+        Header,
+        Input,
+        DataTable,
+        Label,
+        RichLog,
+        Static,
+        TabbedContent,
+        TabPane,
+        TextArea,
+    )
 except ImportError as exc:  # Optional dependency: keep the CLI usable without Textual.
     _TEXTUAL_IMPORT_ERROR: ImportError | None = exc
 else:
@@ -150,6 +167,29 @@ else:
 
 
 if _TEXTUAL_IMPORT_ERROR is None:
+
+    def _format_approval_request(request: dict[str, object]) -> str:
+        """Render an approval request as a readable write preview."""
+
+        tool_name = str(request.get("tool_name") or request.get("name") or "未知工具")
+        lines = [f"操作：{tool_name}"]
+        if request.get("session_id"):
+            lines.append(f"会话：{request['session_id']}")
+        if request.get("user_id"):
+            lines.append(f"用户：{request['user_id']}")
+        arguments = request.get("arguments")
+        lines.append("写入内容预览：")
+        if isinstance(arguments, dict) and arguments:
+            for key, value in arguments.items():
+                rendered = (
+                    json.dumps(value, ensure_ascii=False, indent=2, default=str)
+                    if isinstance(value, (dict, list))
+                    else str(value)
+                )
+                lines.append(f"- {key}: {rendered}")
+        else:
+            lines.append("- 无参数")
+        return "\n".join(lines)
 
     class _ApprovalScreen(ModalScreen):
         BINDINGS = [("escape", "deny", "拒绝")]
@@ -189,7 +229,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self.event = event
 
         def compose(self) -> ComposeResult:
-            details = json.dumps(self.request, ensure_ascii=False, indent=2, default=str)
+            details = _format_approval_request(self.request)
             with Container(id="approval-dialog"):
                 yield Label(f"{self.title_text} 请求授权", id="approval-title")
                 yield Static(details, id="approval-details")
@@ -247,9 +287,58 @@ if _TEXTUAL_IMPORT_ERROR is None:
             padding: 0 1;
             scrollbar-size: 1 1;
         }
+        #result-tabs {
+            height: 1fr;
+            border: round $primary;
+        }
+        #candidate-table {
+            height: auto;
+            min-height: 5;
+            max-height: 12;
+            margin: 0 1;
+            scrollbar-size: 1 1;
+        }
+        .comparison-title {
+            height: 1;
+            margin: 0 1;
+            text-style: bold;
+        }
+        #use-case-table {
+            height: auto;
+            min-height: 3;
+            max-height: 8;
+            margin: 0 1;
+            scrollbar-size: 1 1;
+        }
+        #candidates, #tools {
+            height: 1fr;
+            padding: 0 1;
+            scrollbar-size: 1 1;
+        }
         #prompt {
             height: 1fr;
             border: round $accent;
+        }
+        #path-inputs {
+            height: auto;
+            margin-bottom: 1;
+        }
+        .path-label {
+            height: 1;
+            content-align: left middle;
+            text-style: bold;
+        }
+        #path-inputs Input {
+            height: 3;
+            margin-bottom: 1;
+            border: round $secondary;
+        }
+        #path-actions {
+            height: 3;
+            align: right middle;
+        }
+        #path-actions Button {
+            margin-left: 1;
         }
         #input-meta {
             height: 4;
@@ -271,7 +360,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             height: 1fr;
             padding: 0 1;
         }
-        #status, #config, #tools {
+        #status, #config, #paths, #result-summary {
             border: round $secondary;
             padding: 1;
         }
@@ -288,9 +377,18 @@ if _TEXTUAL_IMPORT_ERROR is None:
             max-height: 12;
             margin-top: 1;
         }
-        #tools {
-            height: 1fr;
+        #result-summary {
+            height: auto;
+            max-height: 9;
             margin-top: 1;
+        }
+        #result-actions {
+            height: 3;
+            align: right middle;
+            margin-top: 1;
+        }
+        #result-actions Button {
+            margin-left: 1;
         }
         """
 
@@ -310,7 +408,10 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self.initial_message = initial_message
             self.initial_source = initial_source
             self._active_input: str | None = None
+            self._active_input_source: str | None = None
+            self._last_output_path: Path | None = None
             self._busy = False
+            self._path_loading = False
 
             if runtime is not None:
                 self.set_runtime(runtime)
@@ -327,6 +428,18 @@ if _TEXTUAL_IMPORT_ERROR is None:
             return self.query_one("#conversation", RichLog)
 
         @property
+        def candidates_log(self) -> RichLog:
+            return self.query_one("#candidates", RichLog)
+
+        @property
+        def candidate_table(self) -> DataTable:
+            return self.query_one("#candidate-table", DataTable)
+
+        @property
+        def use_case_table(self) -> DataTable:
+            return self.query_one("#use-case-table", DataTable)
+
+        @property
         def tools_log(self) -> RichLog:
             return self.query_one("#tools", RichLog)
 
@@ -336,6 +449,24 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 with Horizontal(id="workbench"):
                     with Vertical(id="input-panel"):
                         yield Static("输入 IR / SC / UC", classes="panel-title")
+                        with Vertical(id="path-inputs"):
+                            yield Label("IR 文档路径", classes="path-label")
+                            yield Input(
+                                placeholder="可选：.txt / .md / .json / .docx / .pdf",
+                                id="ir-path",
+                            )
+                            yield Label("场景库路径", classes="path-label")
+                            yield Input(
+                                placeholder="JSON 文件，或场景库目录（自动使用 uc/use_cases.json）",
+                                id="library-path",
+                            )
+                            with Horizontal(id="path-actions"):
+                                yield Button(
+                                    "读取 IR 并发送",
+                                    id="send-paths",
+                                    variant="success",
+                                )
+                                yield Button("清空路径", id="clear-paths")
                         yield TextArea(
                             placeholder="粘贴 IR/SC/UC，或描述你的需求。Ctrl+Enter 发送。",
                             id="prompt",
@@ -347,15 +478,29 @@ if _TEXTUAL_IMPORT_ERROR is None:
                             yield Button("退出", id="quit", variant="error")
                     with Vertical(id="output-panel"):
                         yield Static("Agent 输出", classes="panel-title")
-                        yield RichLog(id="conversation", wrap=True, markup=False)
+                        with TabbedContent(initial="conversation-tab", id="result-tabs"):
+                            with TabPane("对话", id="conversation-tab"):
+                                yield RichLog(id="conversation", wrap=True, markup=False)
+                            with TabPane("候选对比", id="candidates-tab"):
+                                yield Static("SC 候选", classes="comparison-title")
+                                yield DataTable(id="candidate-table", cursor_type="row")
+                                yield Static("UC 候选（按父 SC 过滤）", classes="comparison-title")
+                                yield DataTable(id="use-case-table", cursor_type="row")
+                                yield RichLog(id="candidates", wrap=True, markup=False)
+                            with TabPane("工具日志", id="tools-tab"):
+                                yield RichLog(id="tools", wrap=True, markup=False)
                 with Vertical(id="side"):
                     yield Static("状态：启动中", id="status")
                     yield Static("配置", id="config")
                     yield Static("路径", id="paths")
-                    yield RichLog(id="tools", wrap=True, markup=False)
+                    yield Static("暂无结果", id="result-summary")
+                    with Horizontal(id="result-actions"):
+                        yield Button("打开输出目录", id="open-output", disabled=True)
+                        yield Button("打开结果文件", id="open-result", disabled=True)
             yield Footer()
 
         def on_mount(self) -> None:
+            self._reset_candidate_table()
             if (
                 self.runtime is None
                 or self.agent is None
@@ -376,6 +521,16 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 f"远程 MCP：{'开启' if mcp_enabled else '关闭'}",
                 f"插件：{len(self.runtime.plugin_report.loaded)} 个",
             ]
+            matching_rules = getattr(getattr(self.agent, "spec", None), "matching_rules", {})
+            if isinstance(matching_rules, dict):
+                config_lines.extend(
+                    [
+                        f"SC 复用线：{self._rule_number(matching_rules, 'scenario_reuse_threshold', 0.45):.2f}",
+                        f"SC 强匹配线：{self._rule_number(matching_rules, 'scenario_strong_threshold', 0.70):.2f}",
+                        f"UC 复用线：{self._rule_number(matching_rules, 'use_case_reuse_threshold', 0.45):.2f}",
+                        f"歧义分差：{self._rule_number(matching_rules, 'ambiguity_margin', 0.08):.2f}",
+                    ]
+                )
             self.query_one("#config", Static).update("\n".join(config_lines))
             path_lines = [
                 f"场景库：{self.agent.library.path.resolve()}",
@@ -385,8 +540,25 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 f"审计：{self.settings.audit_path.resolve()}",
             ]
             self.query_one("#paths", Static).update("\n".join(path_lines))
+            library_input = self.query_one("#library-path", Input)
+            library_input.value = str(self.settings.library_path.resolve())
+            if self.initial_source:
+                initial_path = Path(self.initial_source).expanduser()
+                if initial_path.is_file():
+                    self.query_one("#ir-path", Input).value = str(initial_path.resolve())
+            initial_session_context = {
+                "library_path": str(self.agent.library.path.resolve()),
+                "uc_library_path": (
+                    str(self.agent.library.use_case_path.resolve())
+                    if self.agent.library.use_case_path is not None
+                    else ""
+                ),
+                "spec_path": str(self.settings.spec_path.resolve()),
+            }
+            if self.session.bind_context(initial_session_context):
+                self.tools_log.write("当前会话与已加载场景库不一致，旧上下文已清空。")
             self.conversation.write(
-                "系统：TUI 已启动。输入区和输出区已分开；发送后结果会保存为 JSON。"
+                "系统：TUI 已启动。可直接粘贴文本，或填写 IR 文档路径和场景库路径后读取。"
             )
             for error in self.runtime.plugin_report.errors:
                 self.tools_log.write(f"插件未加载：{error}")
@@ -405,9 +577,23 @@ if _TEXTUAL_IMPORT_ERROR is None:
             button_id = event.button.id
             if button_id == "send":
                 self._submit()
+            elif button_id == "send-paths":
+                self._submit_from_paths()
+            elif button_id == "clear-paths":
+                self.query_one("#ir-path", Input).value = ""
+                self.query_one("#library-path", Input).value = ""
+                self._set_input_meta("路径输入已清空；当前运行仍使用已加载的场景库。")
             elif button_id == "clear-input":
                 self.query_one("#prompt", TextArea).clear()
                 self._set_input_meta("输入区已清空。")
+            elif button_id == "open-output":
+                self._open_result_path(
+                    self._last_output_path.parent
+                    if self._last_output_path is not None
+                    else None
+                )
+            elif button_id == "open-result":
+                self._open_result_path(self._last_output_path)
             elif button_id == "quit":
                 self.exit()
 
@@ -416,8 +602,14 @@ if _TEXTUAL_IMPORT_ERROR is None:
 
         def action_clear_chat(self) -> None:
             self.conversation.clear()
+            self.candidates_log.clear()
+            self._reset_candidate_table()
             self.tools_log.clear()
             self.conversation.write("系统：对话显示已清空，会话上下文仍保留。")
+            self.query_one("#result-summary", Static).update("暂无结果")
+            self._last_output_path = None
+            self.query_one("#open-output", Button).disabled = True
+            self.query_one("#open-result", Button).disabled = True
 
         def open_approval(
             self,
@@ -451,8 +643,179 @@ if _TEXTUAL_IMPORT_ERROR is None:
             else:
                 self.call_from_thread(self._finish_result, result)
 
-        def _submit(self, message: str | None = None, *, source: str = "You") -> None:
-            if self._busy:
+        def _submit_from_paths(self) -> None:
+            if self._busy or self._path_loading:
+                self.notify("上一条请求还在处理中，请稍候。", severity="warning")
+                return
+
+            ir_value = self.query_one("#ir-path", Input).value.strip()
+            library_value = self.query_one("#library-path", Input).value.strip()
+            if not ir_value:
+                self.notify("请填写 IR 文档路径。", severity="warning")
+                return
+            if not library_value:
+                self.notify("请填写场景库路径。", severity="warning")
+                return
+
+            self._path_loading = True
+            self._set_submit_buttons(True)
+            self._set_status("读取 IR 和场景库…")
+            self._load_paths(ir_value, library_value)
+
+        @work(thread=True, exclusive=True)
+        def _load_paths(self, ir_value: str, library_value: str) -> None:
+            try:
+                ir_path = self._existing_path(ir_value, expect_file=True)
+                library_path = self._existing_path(library_value)
+                ir_text = read_document(ir_path).strip()
+                if not ir_text:
+                    raise ValueError("IR 文档为空")
+                library = ScenarioLibrary(library_path)
+                library.document()
+            except Exception as exc:  # User-provided document/library boundary.
+                self.call_from_thread(self._finish_path_load_error, f"路径加载失败：{exc}")
+                return
+
+            self.call_from_thread(
+                self._finish_path_load,
+                ir_text,
+                ir_path,
+                library_path,
+                library,
+            )
+
+        def _finish_path_load_error(self, message: str) -> None:
+            self._path_loading = False
+            self._set_submit_buttons(False)
+            self.tools_log.write(message)
+            self.conversation.write(message)
+            self._set_status("路径输入有误")
+
+        def _finish_path_load(
+            self,
+            ir_text: str,
+            ir_path: Path,
+            library_path: Path,
+            library: ScenarioLibrary,
+        ) -> None:
+            try:
+                self._reload_library(library_path, library=library)
+            except Exception as exc:  # UI boundary: keep the event loop alive.
+                self._finish_path_load_error(f"场景库切换失败：{exc}")
+                return
+
+            self._path_loading = False
+            self.query_one("#prompt", TextArea).text = ir_text
+            self._submit(
+                ir_text,
+                source="IR 文件 + 场景库路径",
+                input_source=f"IR 文件：{ir_path}\n场景库：{library_path}",
+            )
+
+        @staticmethod
+        def _existing_path(raw_value: str, *, expect_file: bool = False) -> Path:
+            cleaned = raw_value.strip().strip('"').strip("'")
+            path = Path(cleaned).expanduser().resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"路径不存在：{path}")
+            if expect_file and not path.is_file():
+                raise ValueError(f"IR 路径不是文件：{path}")
+            if not expect_file and not (path.is_file() or path.is_dir()):
+                raise ValueError(f"场景库路径不是文件或目录：{path}")
+            return path
+
+        def _reload_library(
+            self,
+            path: Path,
+            *,
+            library: ScenarioLibrary | None = None,
+        ) -> None:
+            if self.agent is None or self.settings is None or self.runtime is None:
+                raise RuntimeError("Agent 运行时未初始化")
+
+            library = library or ScenarioLibrary(path)
+            # Validate both the scenario file and, for directory-based
+            # libraries, the derived UC file before switching the agent.
+            library.document()
+            if isinstance(self.agent, IRScenarioAgent):
+                self.agent.library = library
+                self.agent.tools = ToolRegistry(
+                    library,
+                    skills=self.agent.skills,
+                    memory=self.agent.memory,
+                    spec=self.agent.spec,
+                    user_id=self.agent.user_id,
+                )
+                settings = replace(
+                    self.settings,
+                    library_path=path,
+                    uc_library_path=library.use_case_path,
+                )
+                self.settings = settings
+                self.runtime.settings = settings
+                self.agent.settings = settings
+                self.runtime.plugin_report = PluginManager(settings.plugins_dir).load_into(
+                    self.agent.tools,
+                    PluginContext(
+                        settings=settings,
+                        library=library,
+                        skills=self.agent.skills,
+                        memory=self.agent.memory,
+                        spec=self.agent.spec,
+                        user_id=self.agent.user_id,
+                    ),
+                )
+            else:
+                # Keep lightweight test/dummy agents usable without requiring
+                # them to expose the complete production runtime surface.
+                self.agent.library = library
+                self.settings = replace(
+                    self.settings,
+                    library_path=path,
+                    uc_library_path=library.use_case_path,
+                )
+                self.runtime.settings = self.settings
+
+            session_context = {
+                "library_path": str(library.path.resolve()),
+                "uc_library_path": (
+                    str(library.use_case_path.resolve())
+                    if library.use_case_path is not None
+                    else ""
+                ),
+                "spec_path": str(self.settings.spec_path.resolve()),
+            }
+            if self.session is not None and self.session.bind_context(session_context):
+                self.tools_log.write("场景库已切换，旧会话上下文已清空。")
+            self.runtime.session = self.session
+
+            uc_library_path = library.use_case_path
+            self.query_one("#paths", Static).update(
+                "\n".join(
+                    [
+                        f"场景库：{library.path.resolve()}",
+                        f"UC 库：{uc_library_path.resolve() if uc_library_path else '与场景库同文件'}",
+                        f"Spec：{self.settings.spec_path.resolve()}",
+                        f"输出：{self.settings.outputs_dir.resolve()}",
+                        f"审计：{self.settings.audit_path.resolve()}",
+                    ]
+                )
+            )
+            self.query_one("#library-path", Input).value = str(path)
+            self.tools_log.write(f"已加载场景库：{library.path.resolve()}")
+            if uc_library_path is not None:
+                self.tools_log.write(f"已加载 UC 库：{uc_library_path.resolve()}")
+            for error in self.runtime.plugin_report.errors:
+                self.tools_log.write(f"插件未加载：{error}")
+
+        def _submit(
+            self,
+            message: str | None = None,
+            *,
+            source: str = "You",
+            input_source: str | None = None,
+        ) -> None:
+            if self._busy or self._path_loading:
                 self.notify("上一条请求还在处理中，请稍候。", severity="warning")
                 return
             prompt = self.query_one("#prompt", TextArea)
@@ -460,7 +823,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             if not user_text:
                 self.notify("请输入内容。", severity="warning")
                 return
-            input_source = (
+            input_source = input_source or (
                 self.initial_source
                 if message is not None and self.initial_source
                 else "TUI 输入框"
@@ -471,33 +834,44 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 f"长度：{len(user_text)} 字符（原文保留在输入区）"
             )
             self._active_input = user_text
+            self._active_input_source = input_source
             self.conversation.write(f"输入已提交：{source}（{len(user_text)} 字符）")
             self._busy = True
-            self.query_one("#send", Button).disabled = True
+            self._set_submit_buttons(True)
             self._set_status("处理中…")
             self._run_agent(user_text)
 
         def _finish_result(self, result: Any) -> None:
             self._busy = False
-            self.query_one("#send", Button).disabled = False
+            self._set_submit_buttons(False)
             if self.session_store is not None:
                 try:
                     self.session_store.save(self.session)
                 except Exception as exc:
                     self.tools_log.write(f"会话保存失败：{exc}")
             output_path = self._save_result(result)
+            self._last_output_path = output_path
+            self.query_one("#open-output", Button).disabled = output_path is None
+            self.query_one("#open-result", Button).disabled = output_path is None
             self._write_result(result, output_path)
             self._set_status("就绪")
 
         def _finish_error(self, message: str) -> None:
             self._busy = False
-            self.query_one("#send", Button).disabled = False
+            self._set_submit_buttons(False)
             self.conversation.write(f"错误：{message}")
             self._set_status("发生错误，可继续输入")
 
         def _write_result(self, result: Any, output_path: Path | None) -> None:
             resolution = result.resolution
+            self.candidates_log.clear()
+            self._reset_candidate_table()
             if resolution is None:
+                self.query_one("#result-summary", Static).update(
+                    "本轮返回非结构化文本\n"
+                    + (f"输出：{output_path}" if output_path else "输出文件保存失败")
+                )
+                self.candidates_log.write("本轮没有结构化 SC/UC 候选。")
                 self.conversation.write(f"Agent：\n{result.output_text}")
             else:
                 lines = [
@@ -523,7 +897,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     lines.append(
                         f"新建 Use case：{', '.join(resolution.created_use_case_ids)}"
                     )
-                lines.append(f"置信度：{resolution.confidence:.2f}")
+                lines.append(f"匹配分数（非概率）：{resolution.confidence:.2f}")
                 if resolution.missing_required_fields:
                     lines.append(
                         "缺少必填字段：" + ", ".join(resolution.missing_required_fields)
@@ -533,6 +907,62 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 if resolution.next_steps:
                     lines.append("下一步：" + "；".join(resolution.next_steps))
                 self.conversation.write("Agent：\n" + "\n".join(lines))
+
+                summary_lines = [
+                    f"状态：{resolution.status}",
+                    f"决策：{resolution.decision}",
+                    f"匹配分数（非概率）：{resolution.confidence:.2f}",
+                ]
+                ambiguous = bool(getattr(resolution, "ambiguous", False))
+                score_margin = float(getattr(resolution, "score_margin", 0.0) or 0.0)
+                for call in result.tool_calls:
+                    if call.name != "match_ir_requirement":
+                        continue
+                    match_payload = call.result.get("match")
+                    if isinstance(match_payload, dict):
+                        ambiguous = bool(match_payload.get("ambiguous", ambiguous))
+                        score_margin = float(match_payload.get("score_margin", score_margin) or 0.0)
+                if ambiguous:
+                    summary_lines.append(f"候选分差：{score_margin:.2f}（需确认）")
+                if resolution.selected_scenario_ids:
+                    summary_lines.append(
+                        "场景：" + ", ".join(resolution.selected_scenario_ids)
+                    )
+                if resolution.use_case_ids:
+                    summary_lines.append("UC：" + ", ".join(resolution.use_case_ids))
+                if output_path:
+                    summary_lines.append(f"输出：{output_path}")
+                self.query_one("#result-summary", Static).update("\n".join(summary_lines))
+
+                if not resolution.candidates:
+                    self.candidates_log.write("模型没有返回结构化候选场景。")
+                candidate_details = self._match_candidate_details(result)
+                for index, candidate in enumerate(resolution.candidates, start=1):
+                    details = candidate_details.get(candidate.scenario_id, {})
+                    scenario_name = self._scenario_name(candidate.scenario_id)
+                    conflicts = details.get("conflicts", [])
+                    self.candidate_table.add_row(
+                        str(index),
+                        candidate.scenario_id,
+                        self._clip(scenario_name, 34),
+                        f"{candidate.score:.2f}",
+                        self._clip("、".join(candidate.matched_dimensions) or "-"),
+                        self._clip("；".join(candidate.gaps) or "-"),
+                        self._clip("；".join(conflicts) or "-"),
+                    )
+                    self.candidates_log.write(
+                        f"{index}. {candidate.scenario_id} | 分数 {candidate.score:.2f}"
+                    )
+                    if candidate.matched_dimensions:
+                        self.candidates_log.write(
+                            "   命中：" + "、".join(candidate.matched_dimensions)
+                        )
+                    if candidate.gaps:
+                        self.candidates_log.write("   缺口：" + "；".join(candidate.gaps))
+                    if conflicts:
+                        self.candidates_log.write("   冲突：" + "；".join(conflicts))
+                    self.candidates_log.write(f"   原因：{candidate.reason}")
+                self._write_use_case_candidates(result)
 
             if output_path is not None:
                 self.conversation.write(f"输出文件：{output_path}")
@@ -551,6 +981,107 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     f"{'✓' if ok else '✗'} {call.name} ({call.duration_ms or 0:.0f}ms{approval})"
                 )
 
+        def _reset_candidate_table(self) -> None:
+            table = self.candidate_table
+            table.clear(columns=True)
+            table.add_columns("序号", "SC", "场景名称", "分数", "命中维度", "缺口", "冲突")
+            use_case_table = self.use_case_table
+            use_case_table.clear(columns=True)
+            use_case_table.add_columns("序号", "UC", "用例名称", "分数", "父 SC", "命中词")
+
+        def _write_use_case_candidates(self, result: Any) -> None:
+            raw_matches: list[dict[str, Any]] = []
+            for call in result.tool_calls:
+                payload: object = {}
+                if call.name == "match_ir_requirement":
+                    match_payload = call.result.get("match")
+                    if isinstance(match_payload, dict):
+                        payload = match_payload.get("use_case_matches", [])
+                elif call.name == "match_use_case":
+                    payload = call.result.get("matches", [])
+                if isinstance(payload, list):
+                    raw_matches.extend(
+                        item for item in payload if isinstance(item, dict)
+                    )
+
+            seen: set[str] = set()
+            rows: list[tuple[str, str, str, str, str]] = []
+            for item in raw_matches:
+                use_case = item.get("use_case")
+                if not isinstance(use_case, dict) or not use_case.get("id"):
+                    continue
+                use_case_id = str(use_case["id"])
+                if use_case_id in seen:
+                    continue
+                seen.add(use_case_id)
+                parent_id = str(use_case.get("scenario_id") or "-")
+                matched_terms = item.get("matched_terms", [])
+                rows.append(
+                    (
+                        use_case_id,
+                        str(use_case.get("name") or use_case_id),
+                        f"{float(item.get('score', 0.0) or 0.0):.2f}",
+                        parent_id,
+                        self._clip("、".join(str(value) for value in matched_terms) or "-"),
+                    )
+                )
+
+            if not rows:
+                self.candidates_log.write("本轮没有结构化 UC 候选。")
+                return
+            for index, (use_case_id, name, score, parent_id, matched_terms) in enumerate(
+                rows, start=1
+            ):
+                self.use_case_table.add_row(
+                    str(index),
+                    use_case_id,
+                    self._clip(name, 34),
+                    score,
+                    parent_id,
+                    matched_terms,
+                )
+
+        def _match_candidate_details(self, result: Any) -> dict[str, dict[str, Any]]:
+            details: dict[str, dict[str, Any]] = {}
+            for call in result.tool_calls:
+                if call.name != "match_ir_requirement":
+                    continue
+                payload = call.result.get("match")
+                if not isinstance(payload, dict):
+                    continue
+                for item in payload.get("scenario_matches", []):
+                    if not isinstance(item, dict):
+                        continue
+                    scenario = item.get("scenario")
+                    if not isinstance(scenario, dict) or not scenario.get("id"):
+                        continue
+                    details[str(scenario["id"])] = {
+                        "conflicts": [
+                            str(value) for value in item.get("conflicts", [])
+                        ],
+                    }
+            return details
+
+        def _scenario_name(self, scenario_id: str) -> str:
+            if self.agent is None:
+                return scenario_id
+            try:
+                return self.agent.library.get_scenario(scenario_id).name
+            except Exception:
+                return scenario_id
+
+        @staticmethod
+        def _rule_number(rules: dict[str, object], key: str, default: float) -> float:
+            try:
+                value = float(rules.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            return value if 0.0 <= value <= 1.0 else default
+
+        @staticmethod
+        def _clip(value: str, limit: int = 42) -> str:
+            return value if len(value) <= limit else value[: limit - 1] + "…"
+
         def _save_result(self, result: Any) -> Path | None:
             if self.settings is None or self.session is None:
                 return None
@@ -565,6 +1096,19 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "session_id": self.session.id,
                     "input": self._active_input,
+                    "input_source": self._active_input_source,
+                    "library_path": (
+                        str(self.agent.library.path.resolve())
+                        if self.agent is not None
+                        else None
+                    ),
+                    "uc_library_path": (
+                        str(self.agent.library.use_case_path.resolve())
+                        if self.agent is not None
+                        and self.agent.library.use_case_path is not None
+                        else None
+                    ),
+                    "spec_path": str(self.settings.spec_path.resolve()),
                     "result": result.model_dump(mode="json"),
                 }
                 output_path.write_text(
@@ -578,6 +1122,27 @@ if _TEXTUAL_IMPORT_ERROR is None:
 
         def _set_input_meta(self, text: str) -> None:
             self.query_one("#input-meta", Static).update(text)
+
+        def _open_result_path(self, path: Path | None) -> None:
+            if path is None:
+                self.notify("当前还没有可打开的结果。", severity="warning")
+                return
+            try:
+                resolved = path.resolve()
+                if not resolved.exists():
+                    raise FileNotFoundError(resolved)
+                startfile = getattr(os, "startfile", None)
+                if callable(startfile):
+                    startfile(str(resolved))
+                else:
+                    webbrowser.open(resolved.as_uri())
+            except Exception as exc:
+                self.tools_log.write(f"打开路径失败：{exc}")
+                self.notify(f"打开路径失败：{exc}", severity="error")
+
+        def _set_submit_buttons(self, disabled: bool) -> None:
+            self.query_one("#send", Button).disabled = disabled
+            self.query_one("#send-paths", Button).disabled = disabled
 
         def _set_status(self, text: str) -> None:
             self.query_one("#status", Static).update(f"状态：{text}")
@@ -676,7 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     if args.message and args.input_file:
-        print("--message 和 --input-file 不能同时使用。", file=sys.stderr)
+        print("--message 和 --ir-path/--input-file 不能同时使用。", file=sys.stderr)
         return 2
 
     initial_message = args.message

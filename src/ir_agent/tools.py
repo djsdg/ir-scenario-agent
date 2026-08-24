@@ -388,9 +388,22 @@ class ToolRegistry:
         self.skills = skills
         self.memory = memory
         self.spec = spec or SpecCatalog.default()
+        self.library.configure_matching(self.spec.matching_rules)
         self.user_id = user_id
         self._specs = self._build_specs()
         self._specs.update(self._optional_specs())
+
+    def _reuse_threshold(self, kind: str = "scenario") -> float:
+        key = (
+            "use_case_reuse_threshold"
+            if kind == "use_case"
+            else "scenario_reuse_threshold"
+        )
+        try:
+            value = float(self.library.matching_rules().get(key, 0.45))
+        except (TypeError, ValueError):
+            return 0.45
+        return value if 0.0 <= value <= 1.0 else 0.45
 
     def _build_specs(self) -> dict[str, ToolSpec]:
         return {
@@ -479,7 +492,8 @@ class ToolRegistry:
                 handler=lambda args: {
                     "query": args.query,
                     **_match_recommendation(
-                        self.library.search(args.query, top_k=args.top_k, min_score=args.min_score)
+                        self.library.search(args.query, top_k=args.top_k, min_score=args.min_score),
+                        reuse_threshold=self._reuse_threshold(),
                     ),
                 },
             ),
@@ -540,7 +554,8 @@ class ToolRegistry:
                             scenario_id=args.scenario_id,
                             top_k=args.top_k,
                             min_score=args.min_score,
-                        )
+                        ),
+                        reuse_threshold=self._reuse_threshold("use_case"),
                     ),
                 },
             ),

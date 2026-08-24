@@ -12,7 +12,7 @@ from ir_agent.domain import (
     IRRequirementInput,
     InfluenceFactor,
 )
-from ir_agent.library import ScenarioLibrary
+from ir_agent.library import ScenarioLibrary, tokenize
 
 
 class ScenarioLibraryTests(unittest.TestCase):
@@ -32,6 +32,13 @@ class ScenarioLibraryTests(unittest.TestCase):
         self.assertEqual(matches[0].scenario.id, "scn_enterprise_knowledge_qa")
         self.assertGreater(matches[0].score, 0.5)
         self.assertIn("知", matches[0].matched_terms)
+
+    def test_tokenizer_keeps_short_chinese_phrases_as_evidence(self) -> None:
+        tokens = tokenize("企业知识库多轮检索问答")
+
+        self.assertIn("知", tokens)
+        self.assertIn("知识", tokens)
+        self.assertIn("知识库", tokens)
 
     def test_scenario_cannot_adopt_a_uc_owned_by_another_scenario(self) -> None:
         initial_count = len(self.library.list_scenarios())
@@ -78,9 +85,60 @@ class ScenarioLibraryTests(unittest.TestCase):
         )
 
         self.assertEqual(result.missing_ir_fields, [])
-        self.assertIn(result.decision, {"reuse_scenario_and_uc", "reuse_scenario_create_uc"})
+        self.assertIn(
+            result.decision,
+            {"reuse_scenario_and_uc", "reuse_scenario_create_uc", "needs_clarification"},
+        )
         self.assertIn(result.scenario_matches[0].scenario.id, {"SCN-XXXX-001", "SCN-XXXX-002"})
         self.assertIn("Actor", result.scenario_matches[0].matched_dimensions)
+        self.assertTrue(
+            all(
+                item.use_case.id in result.scenario_matches[0].scenario.use_case_ids
+                for item in result.use_case_matches
+            )
+        )
+        if result.ambiguous:
+            self.assertLess(result.score_margin, 0.08)
+
+    def test_explicit_actor_conflict_requires_clarification(self) -> None:
+        result = self.library.match_ir(
+            IRRequirementInput(
+                title="企业知识库多轮检索问答",
+                description="系统在正常服务期间从企业知识库检索证据并生成可追溯回答。",
+                who="本系统",
+                when="系统正常运行时",
+                where="企业知识库",
+                what="检索知识库证据并生成回答",
+                how=["理解问题", "召回证据", "生成回答"],
+                why="提升回答可信度",
+                how_much=["回答必须可追溯"],
+            ),
+            top_k=3,
+        )
+
+        self.assertEqual(result.decision, "needs_clarification")
+        self.assertIn("Actor 明确冲突", result.scenario_matches[0].conflicts)
+        self.assertTrue(any("硬冲突" in item for item in result.rationale))
+
+    def test_uncovered_critical_dimension_blocks_auto_reuse(self) -> None:
+        result = self.library.match_ir(
+            IRRequirementInput(
+                title="某指令异常检测和隔离",
+                description="控制器在正常运行时检测某部件异常并隔离节点。",
+                who="控制器",
+                when="系统正常运行时",
+                where="某部件",
+                what="检测某指令异常并隔离节点",
+                how=["检测异常", "隔离节点"],
+                why="提升可靠性",
+                how_much=["检测后告警"],
+            ),
+            top_k=3,
+        )
+
+        self.assertEqual(result.decision, "needs_clarification")
+        self.assertTrue(any("关键维度" in item for item in result.rationale))
+        self.assertIn("Actor未覆盖", result.rationale[-1])
 
     def test_incomplete_ir_requires_clarification(self) -> None:
         result = self.library.match_ir(

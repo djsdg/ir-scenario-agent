@@ -78,6 +78,13 @@ class SpecCatalog:
         owner = self._payload.get("default_owner")
         return str(owner) if owner else None
 
+    @property
+    def matching_rules(self) -> dict[str, Any]:
+        """Return deterministic matching knobs for the active business domain."""
+
+        rules = self._payload.get("matching", {})
+        return deepcopy(rules) if isinstance(rules, dict) else {}
+
     def scenario_required_fields(self) -> list[str]:
         return [
             str(item)
@@ -144,6 +151,7 @@ class SpecCatalog:
             "required_scenario_fields": self.scenario_required_fields(),
             "required_uc_fields": self.use_case_required_fields(),
             "relationship_constraints": self._payload.get("relationship_constraints", {}),
+            "matching": self.matching_rules,
             "influence_factor_dimensions": self._payload.get("influence_factor_dimensions", {}),
             "ir_to_scenario_mapping": self._payload.get("ir_to_scenario_mapping", []),
             "identification_views": self._payload.get("identification_views", []),
@@ -399,6 +407,35 @@ def _fallback_spec() -> dict[str, Any]:
         "workflow_statuses": ["Draft", "Inwork", "Review", "Publish", "Obsolete"],
         "default_workflow_status": "Draft",
         "default_category": "派生场景",
+        "matching": {
+            "scenario_reuse_threshold": 0.45,
+            "scenario_strong_threshold": 0.70,
+            "use_case_reuse_threshold": 0.45,
+            "ambiguity_margin": 0.08,
+            "critical_dimensions_for_reuse": ["Actor", "上下文", "影响因素"],
+            "actor_categories": {
+                "system": ["本系统", "系统自身", "软件", "进程"],
+                "user": ["用户", "客户", "操作员", "人员"],
+                "maintenance": ["运维", "管理员", "维护人员", "管理人员"],
+                "external_system": ["外部系统", "周边系统", "第三方系统"],
+                "device": ["设备", "部件", "节点", "硬件"],
+            },
+            "lifecycle_categories": {
+                "normal_service": ["正常服务", "正常运行", "正常工作", "运行时"],
+                "maintenance": ["维护", "检修", "维修"],
+                "deployment": ["灌装", "部署", "安装", "配置"],
+                "upgrade": ["升级", "更新"],
+                "retirement": ["退网", "退役", "下线"],
+                "fault_recovery": ["故障恢复", "故障", "异常恢复"],
+            },
+            "component_categories": {
+                "type_a": ["类型a", "typea"],
+                "type_b": ["类型b", "typeb"],
+                "single_node": ["单节点"],
+                "multi_node": ["多节点", "集群"],
+                "unrestricted": ["不限", "不限制"],
+            },
+        },
         "hard_required_scenario_fields": [
             "description", "category", "business_goal", "actor", "actions",
             "influence_factors", "lifecycle", "constraints", "owner",

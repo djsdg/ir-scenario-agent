@@ -178,6 +178,7 @@ class AgentSession:
 
     id: str = field(default_factory=lambda: uuid4().hex)
     input_items: list[dict[str, Any]] = field(default_factory=list)
+    context: dict[str, str] = field(default_factory=dict)
 
     def add_user_message(self, text: str) -> None:
         self.input_items.append({"role": "user", "content": text})
@@ -232,14 +233,38 @@ class AgentSession:
                 flattened = marked
         self.input_items = flattened
 
+    def bind_context(self, context: dict[str, str]) -> bool:
+        """Bind this session to a library/spec context.
+
+        A persisted session from an older version may not have context
+        metadata. It is bound without clearing in that compatibility case;
+        an explicit known context switch clears the old history. Returns
+        whether existing history was cleared.
+        """
+
+        normalized = {str(key): str(value) for key, value in context.items()}
+        changed_context = bool(self.context) and self.context != normalized
+        reset = changed_context
+        if reset:
+            self.input_items = []
+        self.context = normalized
+        return reset
+
     def as_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "input_items": self.input_items}
+        return {"id": self.id, "input_items": self.input_items, "context": self.context}
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any], *, session_id: str | None = None) -> "AgentSession":
+        raw_context = payload.get("context")
+        context = (
+            {str(key): str(value) for key, value in raw_context.items()}
+            if isinstance(raw_context, dict)
+            else {}
+        )
         return cls(
             id=session_id or str(payload.get("id") or uuid4().hex),
             input_items=list(payload.get("input_items") or []),
+            context=context,
         )
 
 
@@ -285,7 +310,7 @@ DEFAULT_INSTRUCTIONS = """
 1. 从 IR 原文抽取 code/title/description/source、Who/When/Where/What/How/Why/How Much、约束和 DFX。原文为空的字段使用 null 或空数组，不得猜测。
 2. 有完整 IR 时必须先调用 match_ir_requirement；如果用户只提供 SC 描述，调用 match_scenario；如果只提供 UC 行为链，调用 match_use_case；只有需要原始候选列表的零散查询才调用 search_scenarios 或 search_use_cases。不要凭记忆声称场景或 UC 存在。
 3. 匹配必须同时检查：目标与故障表现、Actor、生命周期/上下文、影响因素/部件、约束，以及 UC 的触发→处理→保证链路。
-4. match_ir_requirement 的 decision 有四种：reuse_scenario_and_uc、reuse_scenario_create_uc、create_scenario_and_uc、needs_clarification。遵循工具结论，并说明差异。
+4. match_ir_requirement 的 decision 有四种：reuse_scenario_and_uc、reuse_scenario_create_uc、create_scenario_and_uc、needs_clarification。遵循工具结论，并说明差异；如果工具返回硬冲突或 ambiguous=true，不得自动复用，必须请求人工确认。
 5. 场景必须遵循当前 active_business_spec：description、category、business_goal、actor、actions、influence_factors、lifecycle、constraints、owner 都要有；每个 influence_factor 必须有 kind、dimension、name 和至少一个 selected_value。缺任一项时不得调用 create_scenario。
 6. UC 是 SC 的子对象：一个 UC 只能隶属于一个父 SC。新 UC 必须给出 description、actor、preconditions、trigger_event、success_guarantee、minimum_guarantee 和至少一个 main_success_scenario 步骤，并在 create_use_case 中传入唯一的 scenario_id。空壳 UC 不得写入。
 7. 判断需要新建或细化时，先调用 draft_scenario_from_ir；选定一个父场景后调用 draft_use_cases_from_ir。该草稿工具可为多个候选父场景分别生成备选草稿，但每个最终创建的 UC 只能选择其中一个父场景。草稿工具只读，会返回 Spec 缺口。
@@ -650,11 +675,23 @@ class IRScenarioAgent:
         )
         self.instructions = instructions
 
+    def _session_context(self) -> dict[str, str]:
+        return {
+            "library_path": str(self.library.path.resolve()),
+            "uc_library_path": (
+                str(self.library.use_case_path.resolve())
+                if self.library.use_case_path is not None
+                else ""
+            ),
+            "spec_path": str(self.settings.spec_path.resolve()),
+        }
+
     def run(self, user_input: str, *, session: AgentSession | None = None) -> AgentResult:
         if not user_input.strip():
             raise ValueError("user_input must not be empty")
 
         active_session = session or AgentSession()
+        active_session.bind_context(self._session_context())
         active_session.add_user_message(user_input)
         records: list[ToolCallRecord] = []
         audit_event_ids: list[str] = []

@@ -242,12 +242,27 @@ class AgentTests(unittest.TestCase):
     def test_session_store_round_trip(self) -> None:
         store = SessionStore(Path(self.temp_dir.name) / "sessions")
         session = AgentSession(id="round-trip")
+        session.bind_context({"library_path": "library.json", "spec_path": "spec.json"})
         session.add_user_message("hello")
         store.save(session)
 
         loaded = store.load("round-trip")
         self.assertEqual(loaded.id, "round-trip")
         self.assertEqual(loaded.input_items, [{"role": "user", "content": "hello"}])
+        self.assertEqual(loaded.context["library_path"], "library.json")
+
+    def test_session_context_switch_clears_old_library_history(self) -> None:
+        session = AgentSession(id="context-switch")
+        session.bind_context({"library_path": "old-library", "spec_path": "spec.json"})
+        session.add_user_message("旧场景库中的需求")
+
+        reset = session.bind_context(
+            {"library_path": "new-library", "spec_path": "spec.json"}
+        )
+
+        self.assertTrue(reset)
+        self.assertEqual(session.input_items, [])
+        self.assertEqual(session.context["library_path"], "new-library")
 
     def test_agent_parses_structured_resolution_and_usage(self) -> None:
         transport = StructuredFinalTransport()

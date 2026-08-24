@@ -22,9 +22,12 @@
   - `create_use_case`：创建完整 UC 并自动挂到唯一父场景。
   - `link_scenario_use_cases`：把尚未归属的 UC 挂到一个场景；已归属其他场景的 UC 会被拒绝。
 - 匹配结果区分四种决策：复用场景和 UC、复用场景但新增 UC、新增场景和 UC、信息不足待澄清。
+- 完整 IR 匹配会返回候选分差和硬冲突；Actor、生命周期、影响部件或范围明确冲突，或最高/次高候选过于接近时，会转为人工澄清，避免误复用。
+- 匹配保留中文单字、二/三字短语和 How Much/DFX 证据；Actor、上下文、影响因素等关键维度未覆盖时，即使总分较高也不会自动复用。
 - 完整 IR 使用 `match_ir_requirement`；单独维护 SC/UC 时分别使用 `match_scenario`/`match_use_case`。独立匹配是只读建议，实际新建仍需调用对应写入工具并经过审批。
 - 支持一个 IR 返回多个场景候选、一个 SC 关联多个 UC；每个 UC 只能归属一个父 SC。新增时按单个 SC/UC 草稿分别审批，避免把独立行为链强行合并。
 - 使用 `config/ir_sc_uc_spec.json` 约束 IR→SC→UC 映射、场景类别/状态、六类影响因素维度和质量输出；不把 IR 直接当 SC。
+- Spec 的 `matching` 段可配置复用阈值、候选歧义分差和领域同义词/冲突词；更换业务领域时优先改配置，不必修改匹配代码。
 - 场景硬性校验 `description`、`category`、`business_goal`、`actor`、`actions`、`lifecycle`、`constraints`、`influence_factors`、`owner`；影响因素至少有一个选中值。
 - UC 硬性校验前置条件、触发事件、成功/最小保证和主成功场景，拒绝写入空壳 UC。
 - 支持项目级 Skill：从 `skills/**/SKILL.md` 自动发现、按需求选择，也可以由 agent 搜索/加载。
@@ -34,6 +37,7 @@
 - agent 自己管理 Responses API 的工具调用循环，支持一轮返回多个工具调用。
 - 本地工具、审批、审计和场景库逻辑与模型供应商解耦；Chat Completions 模式下远程 MCP 不启用，插件和本地 function tools 仍可用。
 - 提供可选 Textual TUI：多行粘贴 IR/SC/UC、后台执行模型请求、显示匹配结果/工具调用，并支持写入与 MCP 授权弹窗。
+- TUI 的 IR 文档和场景库读取在后台任务执行；切换场景库时会隔离旧会话上下文，结果 JSON 同时记录输入来源、SC/UC 库和 Spec 路径。
 - Responses 模式使用严格 JSON Schema；Chat Completions 模式使用 JSON mode 并由 Pydantic 做最终校验，方便后续 Web/API 消费；CLI 默认把它渲染成人类可读摘要。
 - 场景库和记忆写入工具默认需要应用层人工批准；批准、拒绝、耗时和结果会写入 JSONL 审计日志。
 - API 临时失败支持指数退避重试；会话超过本地阈值时优先使用 `/responses/compact`，不可用时使用有界本地回退。
@@ -106,10 +110,15 @@ ir-agent-tui
 TUI 支持多行粘贴和文档启动：
 
 ```powershell
-ir-agent-tui --input-file .\examples\ir_sanitized.txt
+ir-agent-tui --ir-path .\examples\ir_sanitized.txt --library .\data\scenario_library.json
 ```
 
-界面分为独立的输入区、Agent 输出区和运行状态区。使用“发送”按钮或 `Ctrl+Enter` 提交，`Ctrl+L` 清空输出显示，`Ctrl+Q` 退出。每轮结果会保存到 `IR_AGENT_OUTPUT_DIR/<session_id>/`，界面会显示绝对路径；输入原文会保留在输入区，方便复查或修改后重试。TUI 默认仍会对场景库/记忆写入和 MCP 调用弹窗确认；本地调试时可使用 `--auto-approve-writes` 自动批准写入。
+界面分为独立的输入区、Agent 输出区和运行状态区。左侧提供两个可编辑路径输入：
+
+- `IR 文档路径`：支持 `.txt`、`.md`、`.json`、`.docx`、`.pdf`；
+- `场景库路径`：可以填写单个 JSON 文件，也可以填写场景库目录。填写目录时自动使用目录下的 `scenarios.json` 和 `uc/use_cases.json`。
+
+点击“读取 IR 并发送”后，程序会先校验两个路径、读取 IR，再用该场景库执行匹配；也可以继续直接粘贴文本并点击“发送”。输出区分为“对话”“候选对比”“工具日志”三个视图；“候选对比”分别展示 SC 表和按父 SC 过滤的 UC 表，包含名称、分数、命中维度、缺口和冲突，下方保留逐项解释。右侧显示本轮决策摘要，并提供打开结果文件/输出目录按钮。使用 `Ctrl+L` 清空输出显示，`Ctrl+Q` 退出。每轮结果会保存到 `IR_AGENT_OUTPUT_DIR/<session_id>/`，界面会显示绝对输出路径；当前生效的场景库、UC 库、Spec、输出目录和审计日志路径也会显示在右侧。TUI 默认仍会对场景库/记忆写入和 MCP 调用弹窗确认；本地调试时可使用 `--auto-approve-writes` 自动批准写入。
 
 也可以直接执行一次：
 

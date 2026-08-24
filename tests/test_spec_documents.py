@@ -35,6 +35,14 @@ class SpecAndDocumentTests(unittest.TestCase):
             "hardware_environment",
         )
 
+    def test_spec_exposes_matching_rules(self) -> None:
+        rules = self.spec.matching_rules
+
+        self.assertEqual(rules["scenario_reuse_threshold"], 0.45)
+        self.assertEqual(rules["scenario_strong_threshold"], 0.70)
+        self.assertIn("system", rules["actor_categories"])
+        self.assertIn("normal_service", rules["lifecycle_categories"])
+
     def test_spec_derives_uc_for_existing_scenario(self) -> None:
         requirement = self.library.get_requirement("IR-XXXX-001")
         scenario = self.library.get_scenario("SCN-XXXX-001")

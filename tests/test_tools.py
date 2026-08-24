@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from ir_agent.library import ScenarioLibrary
+from ir_agent.specs import SpecCatalog
 from ir_agent.tools import ToolRegistry
 
 
@@ -126,6 +127,27 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(result["decision"], "reuse_existing")
         self.assertEqual(result["matches"][0]["scenario"]["id"], "scn_enterprise_knowledge_qa")
         self.assertGreaterEqual(result["confidence"], result["reuse_threshold"])
+
+    def test_standalone_match_uses_spec_reuse_threshold(self) -> None:
+        payload = SpecCatalog.default().payload
+        payload["matching"]["scenario_reuse_threshold"] = 0.99
+        registry = ToolRegistry(
+            self.registry.library,
+            spec=SpecCatalog(payload),
+        )
+
+        result = registry.execute(
+            "match_scenario",
+            {
+                "query": "企业知识库多轮检索问答",
+                "top_k": 5,
+                "min_score": 0.0,
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reuse_threshold"], 0.99)
+        self.assertEqual(result["decision"], "create_new")
 
     def test_standalone_use_case_match_can_be_scoped_to_parent_scenario(self) -> None:
         result = self.registry.execute(

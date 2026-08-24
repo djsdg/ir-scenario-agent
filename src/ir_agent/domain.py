@@ -149,6 +149,7 @@ class ScenarioMatch(BaseModel):
     matched_terms: list[str] = Field(default_factory=list)
     matched_dimensions: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
 
 
 class UseCaseMatch(BaseModel):
@@ -168,6 +169,8 @@ class IRMatchResult(BaseModel):
     use_case_matches: list[UseCaseMatch]
     decision: MatchDecision
     confidence: float = Field(ge=0.0, le=1.0)
+    score_margin: float = Field(default=0.0, ge=0.0, le=1.0)
+    ambiguous: bool = False
     rationale: list[str]
 
 

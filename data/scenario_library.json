@@ -762,7 +762,7 @@
       "topology_diagram": null,
       "ir_intent": "根据故障表现检测异常并修复或隔离节点。",
       "created_at": "2026-08-21T00:00:00Z",
-      "updated_at": "2026-08-24T01:43:40.323981Z",
+      "updated_at": "2026-08-24T02:57:30.163386Z",
       "metadata": {
         "source": "sanitized-example",
         "topology_status": "missing"

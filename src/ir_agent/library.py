@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
@@ -46,14 +47,189 @@ _STOPWORDS = {
     "一个",
     "可以",
     "需要",
+    "某",
+    "当前",
+    "相关",
+    "进行",
+    "其中",
+    "一种",
+    "明确",
+    "可能",
+    "能够",
+    "支持",
+    "用于",
+    "实现",
+    "根据",
+    "对于",
     "系统",
 }
 
+_CJK_RUN_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}")
+
+_ACTOR_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "system": ("本系统", "系统自身", "软件", "进程"),
+    "user": ("用户", "客户", "操作员", "人员"),
+    "maintenance": ("运维", "管理员", "维护人员", "管理人员"),
+    "external_system": ("外部系统", "周边系统", "第三方系统"),
+    "device": ("设备", "部件", "节点", "硬件"),
+}
+
+_LIFECYCLE_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "normal_service": ("正常服务", "正常运行", "正常工作", "运行时"),
+    "maintenance": ("维护", "检修", "维修"),
+    "deployment": ("灌装", "部署", "安装", "配置"),
+    "upgrade": ("升级", "更新"),
+    "retirement": ("退网", "退役", "下线"),
+    "fault_recovery": ("故障恢复", "故障", "异常恢复"),
+}
+
+_COMPONENT_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "type_a": ("类型a", "typea"),
+    "type_b": ("类型b", "typeb"),
+    "single_node": ("单节点",),
+    "multi_node": ("多节点", "集群"),
+    "unrestricted": ("不限", "不限制"),
+}
+
+_SCENARIO_REUSE_THRESHOLD = 0.45
+_SCENARIO_STRONG_THRESHOLD = 0.70
+_USE_CASE_REUSE_THRESHOLD = 0.45
+_AMBIGUITY_MARGIN_THRESHOLD = 0.08
+_CRITICAL_DIMENSIONS_FOR_REUSE = ("Actor", "上下文", "影响因素")
+
+
+def _configured_threshold(
+    rules: dict[str, object],
+    key: str,
+    default: float,
+) -> float:
+    try:
+        value = float(rules.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return value if 0.0 <= value <= 1.0 else default
+
+
+def _configured_categories(
+    rules: dict[str, object],
+    key: str,
+    defaults: dict[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    raw = rules.get(key)
+    if not isinstance(raw, dict):
+        return defaults
+    configured: dict[str, tuple[str, ...]] = dict(defaults)
+    changed = False
+    for category, terms in raw.items():
+        if not isinstance(terms, (list, tuple)):
+            continue
+        cleaned = tuple(
+            str(term).strip()
+            for term in terms
+            if term is not None and str(term).strip()
+        )
+        if cleaned:
+            category_name = str(category)
+            existing = configured.get(category_name, ())
+            configured[category_name] = tuple(dict.fromkeys([*existing, *cleaned]))
+            changed = True
+    return configured if changed else defaults
+
+
+def _configured_strings(
+    rules: dict[str, object],
+    key: str,
+    defaults: tuple[str, ...],
+) -> tuple[str, ...]:
+    raw = rules.get(key)
+    if not isinstance(raw, (list, tuple)):
+        return defaults
+    configured = tuple(
+        str(item).strip()
+        for item in raw
+        if item is not None and str(item).strip()
+    )
+    return configured or defaults
+
 
 def tokenize(text: str) -> list[str]:
-    """Dependency-free lexical tokenizer; the retrieval boundary is replaceable."""
+    """Tokenize words, Chinese characters, and short Chinese phrases.
 
-    return [token for token in _TOKEN_PATTERN.findall(text.lower()) if token not in _STOPWORDS]
+    Keeping single Chinese characters preserves recall for legacy data, while
+    adding bi/tri-grams makes an exact phrase stronger evidence than a few
+    unrelated shared characters.
+    """
+
+    normalized = text.casefold()
+    tokens = _TOKEN_PATTERN.findall(normalized)
+    for run in _CJK_RUN_PATTERN.findall(normalized):
+        for size in (2, 3):
+            if len(run) < size:
+                continue
+            tokens.extend(run[index : index + size] for index in range(len(run) - size + 1))
+    return [token for token in tokens if token not in _STOPWORDS]
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"[\s_\-/]+", "", text.casefold())
+
+
+def _category_hits(text: str, categories: dict[str, tuple[str, ...]]) -> set[str]:
+    normalized = _compact(text)
+    return {
+        category
+        for category, terms in categories.items()
+        if any(_compact(term) in normalized for term in terms)
+    }
+
+
+def _exclusive_conflict(
+    query: str,
+    document: str,
+    categories: dict[str, tuple[str, ...]],
+) -> bool:
+    query_categories = _category_hits(query, categories)
+    document_categories = _category_hits(document, categories)
+    return bool(
+        query_categories
+        and document_categories
+        and query_categories.isdisjoint(document_categories)
+    )
+
+
+def _scenario_conflicts(
+    ir: IRRequirementInput,
+    scenario: Scenario,
+    *,
+    actor_categories: dict[str, tuple[str, ...]] | None = None,
+    lifecycle_categories: dict[str, tuple[str, ...]] | None = None,
+    component_categories: dict[str, tuple[str, ...]] | None = None,
+) -> list[str]:
+    actor_categories = actor_categories or _ACTOR_CATEGORIES
+    lifecycle_categories = lifecycle_categories or _LIFECYCLE_CATEGORIES
+    component_categories = component_categories or _COMPONENT_CATEGORIES
+    conflicts: list[str] = []
+    if _exclusive_conflict(ir.who or "", scenario.actor, actor_categories):
+        conflicts.append("Actor 明确冲突")
+    if _exclusive_conflict(ir.when or "", scenario.lifecycle or "", lifecycle_categories):
+        conflicts.append("生命周期明确冲突")
+
+    scenario_values = " ".join(
+        [factor.name for factor in scenario.influence_factors]
+        + [
+            value
+            for factor in scenario.influence_factors
+            for value in factor.selected_values
+        ]
+        + scenario.affected_components
+        + scenario.constraints
+    )
+    requirement_values = " ".join(
+        [ir.where or "", ir.description, *ir.constraints, *ir.tags]
+    )
+    if _exclusive_conflict(requirement_values, scenario_values, component_categories):
+        conflicts.append("影响部件或范围明确冲突")
+    return conflicts
 
 
 def _coverage(query: str, document: str) -> tuple[float, set[str]]:
@@ -62,7 +238,17 @@ def _coverage(query: str, document: str) -> tuple[float, set[str]]:
         return 0.0, set()
     document_terms = set(tokenize(document))
     matched = query_terms & document_terms
-    return len(matched) / len(query_terms), matched
+    total_weight = sum(_token_weight(token) for token in query_terms)
+    matched_weight = sum(_token_weight(token) for token in matched)
+    return (matched_weight / total_weight if total_weight else 0.0), matched
+
+
+def _token_weight(token: str) -> float:
+    if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+        if len(token) == 1:
+            return 0.5
+        return float(min(len(token), 3))
+    return 1.0
 
 
 class ScenarioLibrary:
@@ -93,7 +279,20 @@ class ScenarioLibrary:
         if self.use_case_path is not None and self.use_case_path.resolve() == self.path.resolve():
             self.use_case_path = None
         self._lock = RLock()
+        self._matching_rules: dict[str, object] = {}
         self._ensure_exists()
+
+    def configure_matching(self, rules: dict[str, object] | None) -> None:
+        """Set business-domain matching rules without changing library data."""
+
+        with self._lock:
+            self._matching_rules = deepcopy(rules) if isinstance(rules, dict) else {}
+
+    def matching_rules(self) -> dict[str, object]:
+        """Return a defensive copy of the active matching rules."""
+
+        with self._lock:
+            return deepcopy(self._matching_rules)
 
     def _ensure_exists(self) -> None:
         if self.path.exists():
@@ -246,28 +445,22 @@ class ScenarioLibrary:
 
         matches: list[ScenarioMatch] = []
         for scenario in self.list_scenarios():
-            name_tokens = set(tokenize(scenario.name))
-            description_tokens = set(tokenize(scenario.description))
-            intent_tokens = set(
-                tokenize(
-                    " ".join(
-                        [
-                            scenario.ir_intent,
-                            scenario.business_goal or "",
-                            *scenario.actions,
-                        ]
-                    )
-                )
+            searchable_text = " ".join(
+                [
+                    scenario.name,
+                    scenario.description,
+                    scenario.ir_intent,
+                    scenario.business_goal or "",
+                    *scenario.actions,
+                    *scenario.tags,
+                ]
             )
-            tag_tokens = set(tokenize(" ".join(scenario.tags)))
-            searchable_tokens = name_tokens | description_tokens | intent_tokens | tag_tokens
-            matched = query_tokens & searchable_tokens
+            coverage, matched = _coverage(query, searchable_text)
             if not matched:
                 continue
 
-            coverage = len(matched) / len(query_tokens)
-            name_coverage = len(query_tokens & name_tokens) / len(query_tokens)
-            tag_coverage = len(query_tokens & tag_tokens) / len(query_tokens)
+            name_coverage, _ = _coverage(query, scenario.name)
+            tag_coverage, _ = _coverage(query, " ".join(scenario.tags))
             score = min(1.0, 0.65 * coverage + 0.25 * name_coverage + 0.10 * tag_coverage)
             if score >= min_score:
                 matches.append(
@@ -319,12 +512,10 @@ class ScenarioLibrary:
                     *use_case.tags,
                 ]
             )
-            document_terms = set(tokenize(document))
-            matched = query_terms & document_terms
+            coverage, matched = _coverage(query, document)
             if not matched:
                 continue
-            coverage = len(matched) / max(1, len(query_terms))
-            name_coverage = len(query_terms & set(tokenize(use_case.name))) / max(1, len(query_terms))
+            name_coverage, _ = _coverage(query, use_case.name)
             score = min(1.0, 0.8 * coverage + 0.2 * name_coverage)
             if score >= min_score:
                 matches.append(
@@ -345,9 +536,38 @@ class ScenarioLibrary:
         min_score: float = 0.0,
     ) -> IRMatchResult:
         _validate_search_limits(top_k, min_score)
+        rules = self.matching_rules()
+        scenario_reuse_threshold = _configured_threshold(
+            rules, "scenario_reuse_threshold", _SCENARIO_REUSE_THRESHOLD
+        )
+        scenario_strong_threshold = _configured_threshold(
+            rules, "scenario_strong_threshold", _SCENARIO_STRONG_THRESHOLD
+        )
+        use_case_reuse_threshold = _configured_threshold(
+            rules, "use_case_reuse_threshold", _USE_CASE_REUSE_THRESHOLD
+        )
+        ambiguity_margin_threshold = _configured_threshold(
+            rules, "ambiguity_margin", _AMBIGUITY_MARGIN_THRESHOLD
+        )
+        actor_categories = _configured_categories(
+            rules, "actor_categories", _ACTOR_CATEGORIES
+        )
+        lifecycle_categories = _configured_categories(
+            rules, "lifecycle_categories", _LIFECYCLE_CATEGORIES
+        )
+        component_categories = _configured_categories(
+            rules, "component_categories", _COMPONENT_CATEGORIES
+        )
+        critical_dimensions = _configured_strings(
+            rules,
+            "critical_dimensions_for_reuse",
+            _CRITICAL_DIMENSIONS_FOR_REUSE,
+        )
         matches: list[ScenarioMatch] = []
         for scenario in self.list_scenarios():
-            intent_query = " ".join([ir.title, ir.what or "", ir.why or "", *ir.how])
+            intent_query = " ".join(
+                [ir.title, ir.description, ir.what or "", ir.why or "", *ir.how]
+            )
             intent_document = " ".join(
                 [
                     scenario.name,
@@ -375,11 +595,11 @@ class ScenarioLibrary:
                 for value in [factor.name, *factor.candidate_values, *factor.selected_values]
             ]
             impact_score, impact_terms = _coverage(
-                " ".join([ir.where or "", ir.description, *ir.constraints]),
+                " ".join([ir.where or "", ir.description, *ir.constraints, *ir.how_much]),
                 " ".join([*impact_values, *scenario.affected_components]),
             )
             constraint_score, constraint_terms = _coverage(
-                " ".join(ir.constraints),
+                " ".join([*ir.constraints, *ir.how_much]),
                 " ".join(scenario.constraints),
             )
             intent_score, intent_terms = _coverage(intent_query, intent_document)
@@ -398,8 +618,8 @@ class ScenarioLibrary:
                 ("目标/行为", intent_score, bool(intent_query.strip())),
                 ("Actor", actor_score, bool(ir.who)),
                 ("上下文", context_score, bool(ir.when or ir.where)),
-                ("影响因素", impact_score, bool(ir.where or ir.constraints)),
-                ("约束", constraint_score, bool(ir.constraints)),
+                ("影响因素", impact_score, bool(ir.where or ir.constraints or ir.how_much)),
+                ("约束", constraint_score, bool(ir.constraints or ir.how_much)),
             ):
                 if dimension_score > 0:
                     dimensions.append(name)
@@ -413,6 +633,13 @@ class ScenarioLibrary:
                 continue
 
             matched_terms = intent_terms | actor_terms | context_terms | impact_terms | constraint_terms
+            conflicts = _scenario_conflicts(
+                ir,
+                scenario,
+                actor_categories=actor_categories,
+                lifecycle_categories=lifecycle_categories,
+                component_categories=component_categories,
+            )
             matches.append(
                 ScenarioMatch(
                     scenario=scenario,
@@ -420,28 +647,75 @@ class ScenarioLibrary:
                     matched_terms=sorted(matched_terms),
                     matched_dimensions=dimensions,
                     gaps=gaps,
+                    conflicts=conflicts,
                 )
             )
 
         matches.sort(key=lambda item: (-item.score, item.scenario.name))
+        ranked_matches = matches
+        top_score = ranked_matches[0].score if ranked_matches else 0.0
+        score_margin = (
+            round(max(0.0, ranked_matches[0].score - ranked_matches[1].score), 4)
+            if len(ranked_matches) >= 2
+            else (1.0 if ranked_matches else 0.0)
+        )
+        ambiguous = bool(
+            len(ranked_matches) >= 2
+            and top_score >= scenario_reuse_threshold
+            and score_margin < ambiguity_margin_threshold
+        )
         matches = matches[:top_k]
-        use_case_matches = self.search_use_cases(ir.search_text(), top_k=top_k, min_score=0.0)
+        global_use_case_matches = self.search_use_cases(
+            ir.search_text(), top_k=top_k, min_score=0.0
+        )
+        use_case_matches = global_use_case_matches
         missing_fields = ir.missing_fields()
-        top_score = matches[0].score if matches else 0.0
         rationale: list[str] = []
+        top_match = matches[0] if matches else None
+        linked_matches: list[UseCaseMatch] = []
+        critical_gaps: list[str] = []
+        if top_match is not None:
+            critical_gaps = [
+                gap
+                for gap in top_match.gaps
+                if any(gap.startswith(f"{dimension}未") for dimension in critical_dimensions)
+            ]
+            # UC is a child of the selected SC. Search inside that parent's
+            # children for the decision instead of filtering a global top-k
+            # result, which could hide the relevant child UC.
+            linked_matches = self.search_use_cases(
+                ir.search_text(),
+                scenario_id=top_match.scenario.id,
+                top_k=top_k,
+                min_score=0.0,
+            )
+            use_case_matches = linked_matches
 
         if missing_fields:
             decision = "needs_clarification"
             rationale.append(f"IR 缺少 5W2H 字段：{', '.join(missing_fields)}")
-        elif not matches or top_score < 0.45:
+        elif not matches or top_score < scenario_reuse_threshold:
             decision = "create_scenario_and_uc"
             rationale.append("没有达到可复用阈值的场景，需要新建场景并派生 UC 草稿。")
+        elif top_match is not None and top_match.conflicts:
+            decision = "needs_clarification"
+            rationale.append("候选场景存在硬冲突，不能自动复用：" + "、".join(top_match.conflicts))
+        elif critical_gaps:
+            decision = "needs_clarification"
+            rationale.append(
+                "候选场景未覆盖自动复用所需的关键维度：" + "、".join(critical_gaps)
+            )
+        elif ambiguous:
+            decision = "needs_clarification"
+            rationale.append(
+                f"最高候选与次高候选分差仅 {score_margin:.2f}，需要人工确认场景边界。"
+            )
         else:
-            top_scenario = matches[0].scenario
-            linked_matches = [
-                item for item in use_case_matches if item.use_case.id in top_scenario.use_case_ids
-            ]
-            if top_score >= 0.70 and linked_matches and linked_matches[0].score >= 0.45:
+            if (
+                top_score >= scenario_strong_threshold
+                and linked_matches
+                and linked_matches[0].score >= use_case_reuse_threshold
+            ):
                 decision = "reuse_scenario_and_uc"
                 rationale.append("场景关键维度一致，且已有 UC 已覆盖主要触发和处理链路。")
             else:
@@ -455,6 +729,8 @@ class ScenarioLibrary:
             use_case_matches=use_case_matches,
             decision=decision,
             confidence=round(top_score, 4),
+            score_margin=score_margin,
+            ambiguous=ambiguous,
             rationale=rationale,
         )
 
