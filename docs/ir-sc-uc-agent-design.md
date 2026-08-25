@@ -152,6 +152,7 @@ match_ir_requirement
 它会同时匹配 SC 和 UC，并返回：
 
 - `scenario_matches`：候选 SC、分数、命中词、字段级命中证据、命中维度、未覆盖维度和冲突；
+- 每个 SC/UC 候选还返回 `base_score`、`consistency_bonus`、`evaluation`、`dimension_scores` 和 `low_score_reasons`，可以看到分数构成、各维度证据和低分原因；
 - `use_case_matches`：选中候选 SC 的子 UC、分数、字段级命中证据和父 SC；如果没有 SC 候选，才回退到全库 UC 候选；
 - `decision`：复用/新增/待澄清；
 - `confidence`：最高候选 SC 分数；
@@ -159,19 +160,23 @@ match_ir_requirement
 - `ambiguous`：候选是否过于接近；
 - `rationale`：决策原因。
 
+如果用户已经指定了某个 SC 做测试，调用只读工具 `evaluate_scenario_fit`。它不会重新挑选其他场景，也不会写库，只针对指定编号返回总分、维度分、低分原因、缺口、冲突和子 UC 覆盖情况。
+
 ### 5.2 IR→SC 的匹配维度
 
 完整 IR 的 SC 匹配不是只比较标题，而是按以下维度计算：
 
 | 维度 | 权重 | 主要来源 |
 |---|---:|---|
-| 目标/行为意图 | 0.55 | title、description、what、why、how 与 SC 名称、描述、目标、动作、标签 |
+| 目标/行为意图 | 0.45 | title、description、what、why、how 与 SC 名称、描述、目标、动作、标签 |
 | Actor | 0.15 | IR 的 who 与 SC actor |
 | 生命周期/上下文 | 0.10 | when、where 与 SC lifecycle、描述、影响部件 |
 | 影响因素 | 0.10 | where、description、constraints、how_much 与影响因素、部件 |
 | 约束 | 0.10 | IR constraints/how_much 与 SC constraints |
 
 计算后，如果多个维度同时命中，会额外增加少量一致性分，最终分数限制在 `0~1`。
+
+报告会把每个维度拆成 `score × weight = weighted_score`，并同时保留证据、等级（强/部分/弱/缺失/未提供）和文字原因。`confidence_label` 是基于阈值、硬冲突、关键缺口和候选分差计算出的可读评价，不是大模型自由生成的概率。
 
 中文检索同时保留单字、二字和三字短语证据：单字保证旧库召回，短语让“知识库”“异常检测”等连续表达比零散同字更有权重。这是一种可解释的确定性匹配：系统能说明命中了“目标/行为、Actor、上下文、影响因素”中的哪些维度，而不是只返回一个无法解释的向量距离。
 
@@ -367,6 +372,11 @@ Constraints: 只监控 IO 进程；事后检测；数据修复不在范围；可
 ├── result.json       # 完整 AgentResult 和报告
 ├── report.json       # 机器可读的 SC/UC 分层报告
 ├── report.md         # 人工阅读报告
+├── evaluation/       # 评分明细和人工复核 CSV
+│   ├── match_summary.csv
+│   ├── field_comparison.csv
+│   ├── human_review_template.csv
+│   └── scenario_fit.csv
 ├── scenarios/        # SC 命中、选中、新建、更新快照
 └── use_cases/        # UC 命中、选中、新建、更新和按父 SC 分组快照
 ```
@@ -397,7 +407,7 @@ Constraints: 只监控 IO 进程；事后检测；数据修复不在范围；可
 - UC 的 `source_ir_ids` 指向来源 IR；
 - UC 创建请求的 `scenario_id` 指定唯一父 SC，并在写入时建立 SC→UC 关联。
 
-Agent 返回最终 JSON 前还会执行事实校验：候选 SC/选中 SC/UC 必须存在于当前库或本轮工具结果；标记为“新建”的 ID 必须确实来自对应的写入工具结果。若不满足，结果会降级为 `needs_clarification` 并保留缺口，避免模型凭空生成编号。
+Agent 返回最终 JSON 前还会执行事实校验：候选/选中的 SC、UC 必须来自本轮成功的 `match_ir_requirement`、`match_scenario`、`match_use_case` 或 `evaluate_scenario_fit` 返回，而不是仅仅因为编号存在于当前库；标记为“新建”的 ID 必须确实来自对应的写入工具结果。如果模型没有成功调用匹配工具，或输出了未被匹配工具返回的编号，结果会降级为 `needs_clarification` 并保留缺口，避免模型凭空生成或误用编号。
 
 SC/UC 内容更新会递增 `revision`，已进入 `Obsolete` 的记录不能直接覆盖；状态由 `transition_record` 按 Draft → Inwork → Review → Publish → Obsolete 流转。UC 父场景变更必须使用 `move_use_case`，工具会先检查旧关系和目标场景，避免一个 UC 同时属于多个 SC。
 

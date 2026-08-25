@@ -70,6 +70,10 @@ class ReportingTests(unittest.TestCase):
         parent_id = report["use_cases"]["matches"][0]["parent_scenario_id"]
         self.assertEqual(parent_id, report["scenarios"]["matches"][0]["id"])
         self.assertTrue(report["use_cases"]["by_scenario"])
+        self.assertIn("matching", report)
+        self.assertIn("confidence_label", report["matching"])
+        self.assertTrue(report["field_comparison"])
+        self.assertIn("dimension_scores", report["scenarios"]["matches"][0])
 
     def test_report_writes_separate_scenario_and_use_case_folders(self) -> None:
         with tempfile.TemporaryDirectory() as output_dir:
@@ -86,9 +90,50 @@ class ReportingTests(unittest.TestCase):
             self.assertTrue((run_root / "scenarios" / "matches.json").exists())
             self.assertTrue((run_root / "use_cases" / "matches.json").exists())
             self.assertTrue((run_root / "use_cases" / "by_scenario").is_dir())
+            self.assertTrue((run_root / "evaluation" / "match_summary.csv").exists())
+            self.assertTrue((run_root / "evaluation" / "field_comparison.csv").exists())
+            self.assertTrue((run_root / "evaluation" / "human_review_template.csv").exists())
+            self.assertTrue((run_root / "evaluation" / "scenario_fit.csv").exists())
+            summary_csv = (run_root / "evaluation" / "match_summary.csv").read_text(
+                encoding="utf-8-sig"
+            )
+            field_csv = (run_root / "evaluation" / "field_comparison.csv").read_text(
+                encoding="utf-8-sig"
+            )
+            self.assertIn("目标/行为_score", summary_csv)
+            self.assertIn("ai_consistency_hint", field_csv)
             markdown = (run_root / "report.md").read_text(encoding="utf-8")
             self.assertIn("命中部分", markdown)
+            self.assertIn("评分构成", markdown)
+            self.assertIn("人工复核字段表", markdown)
             self.assertIn("SC → UC 关系", markdown)
+
+    def test_report_includes_specified_scenario_evaluation(self) -> None:
+        result = self._result()
+        requirement = self.library.get_requirement("IR-XXXX-001")
+        from ir_agent.domain import IRRequirementInput
+
+        ir = IRRequirementInput.model_validate(
+            requirement.model_dump(exclude={"id", "created_at", "updated_at"})
+        )
+        evaluation = self.library.evaluate_scenario_fit(ir, "SCN-XXXX-001")
+        result.tool_calls.append(
+            ToolCallRecord(
+                name="evaluate_scenario_fit",
+                arguments={"scenario_id": "SCN-XXXX-001"},
+                result={"ok": True, "evaluation": evaluation},
+            )
+        )
+
+        report = build_analysis_report(result, self.library)
+
+        self.assertEqual(
+            report["evaluations"]["scenario_fit"][0]["scenario_id"],
+            "SCN-XXXX-001",
+        )
+        self.assertTrue(
+            any(row["source_type"] == "指定 SC 评估" for row in report["field_comparison"])
+        )
 
     def test_report_captures_scenario_and_use_case_updates(self) -> None:
         result = self._result()

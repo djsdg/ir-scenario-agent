@@ -133,6 +133,10 @@ class ScenarioLibraryTests(unittest.TestCase):
         self.assertIn("Actor", result.scenario_matches[0].matched_dimensions)
         self.assertIn("Actor", result.scenario_matches[0].matched_fields)
         self.assertTrue(result.scenario_matches[0].matched_fields["Actor"])
+        self.assertGreaterEqual(result.scenario_matches[0].base_score, 0.0)
+        self.assertGreaterEqual(result.scenario_matches[0].consistency_bonus, 0.0)
+        self.assertTrue(result.scenario_matches[0].dimension_scores)
+        self.assertTrue(result.confidence_label)
         self.assertTrue(
             all(
                 item.use_case.id in result.scenario_matches[0].scenario.use_case_ids
@@ -147,6 +151,23 @@ class ScenarioLibraryTests(unittest.TestCase):
         )
         if result.ambiguous:
             self.assertLess(result.score_margin, 0.08)
+
+    def test_evaluate_scenario_fit_returns_explainable_dimension_scores(self) -> None:
+        ir = self.library.get_requirement("IR-XXXX-001")
+        normalized_ir = IRRequirementInput.model_validate(
+            ir.model_dump(exclude={"id", "created_at", "updated_at"})
+        )
+
+        evaluation = self.library.evaluate_scenario_fit(
+            normalized_ir,
+            "SCN-XXXX-001",
+        )
+
+        self.assertEqual(evaluation["scenario_id"], "SCN-XXXX-001")
+        self.assertIn("目标/行为", evaluation["dimension_scores"])
+        self.assertIn("matching_rules", evaluation)
+        self.assertIn("low_score_reasons", evaluation)
+        self.assertIsInstance(evaluation["score"], float)
 
     def test_explicit_actor_conflict_requires_clarification(self) -> None:
         result = self.library.match_ir(

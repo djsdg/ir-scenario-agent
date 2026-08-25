@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .domain import (
     CreateScenarioRequest,
     CreateUseCaseRequest,
+    DimensionScore,
     IRMatchResult,
     IRRequirementInput,
     InformationRequirement,
@@ -104,6 +105,13 @@ _SCENARIO_STRONG_THRESHOLD = 0.70
 _USE_CASE_REUSE_THRESHOLD = 0.45
 _AMBIGUITY_MARGIN_THRESHOLD = 0.08
 _CRITICAL_DIMENSIONS_FOR_REUSE = ("Actor", "上下文", "影响因素")
+_IR_DIMENSION_WEIGHTS: dict[str, float] = {
+    "目标/行为": 0.45,
+    "Actor": 0.15,
+    "上下文": 0.15,
+    "影响因素": 0.15,
+    "约束": 0.10,
+}
 
 
 def _configured_threshold(
@@ -166,6 +174,102 @@ def _configured_weight(rules: dict[str, object], key: str, default: float) -> fl
     except (TypeError, ValueError):
         return default
     return value if value >= 0.0 else default
+
+
+def _configured_dimension_weights(rules: dict[str, object]) -> dict[str, float]:
+    """Return normalized IR dimension weights from the active Spec."""
+
+    raw = rules.get("ir_dimension_weights")
+    weights = dict(_IR_DIMENSION_WEIGHTS)
+    if isinstance(raw, dict):
+        for name in weights:
+            try:
+                value = float(raw.get(name, weights[name]))
+            except (TypeError, ValueError):
+                value = weights[name]
+            if value >= 0.0:
+                weights[name] = value
+    total = sum(weights.values())
+    if total <= 0.0:
+        return dict(_IR_DIMENSION_WEIGHTS)
+    return {name: value / total for name, value in weights.items()}
+
+
+def _dimension_level(score: float, supplied: bool) -> str:
+    if not supplied:
+        return "not_provided"
+    if score >= 0.70:
+        return "strong"
+    if score >= 0.45:
+        return "partial"
+    if score > 0.0:
+        return "weak"
+    return "missing"
+
+
+def _evidence_preview(evidence: set[str], *, limit: int = 8) -> str:
+    values = sorted(str(item) for item in evidence if str(item))
+    if not values:
+        return ""
+    preview = "、".join(values[:limit])
+    if len(values) > limit:
+        preview += f"等{len(values)}项"
+    return preview
+
+
+def _dimension_reason(label: str, score: float, evidence: set[str], supplied: bool) -> str:
+    if not supplied:
+        return f"{label}未在 IR 中提供，无法评价。"
+    evidence_text = _evidence_preview(evidence)
+    if score >= 0.70:
+        return f"{label}命中充分：{evidence_text or '字段内容一致'}。"
+    if score >= 0.45:
+        return f"{label}部分命中：{evidence_text or '只有部分字段重合'}。"
+    if score > 0.0:
+        return f"{label}命中较弱：{evidence_text or '只有少量证据'}。"
+    return f"{label}未命中场景库证据。"
+
+
+def _build_dimension_scores(
+    values: dict[str, float],
+    evidence: dict[str, set[str]],
+    supplied: dict[str, bool],
+    weights: dict[str, float],
+) -> tuple[dict[str, DimensionScore], list[str]]:
+    details: dict[str, DimensionScore] = {}
+    low_score_reasons: list[str] = []
+    for label, score in values.items():
+        score = max(0.0, min(1.0, float(score)))
+        is_supplied = bool(supplied.get(label))
+        reason = _dimension_reason(label, score, evidence.get(label, set()), is_supplied)
+        details[label] = DimensionScore(
+            score=round(score, 4),
+            weight=round(weights.get(label, 0.0), 4),
+            weighted_score=round(score * weights.get(label, 0.0), 4),
+            level=_dimension_level(score, is_supplied),
+            evidence=sorted(evidence.get(label, set()))[:100],
+            reason=reason,
+        )
+        if is_supplied and score < 0.70:
+            low_score_reasons.append(reason)
+    return details, low_score_reasons
+
+
+def _scenario_evaluation(
+    score: float,
+    *,
+    reuse_threshold: float,
+    strong_threshold: float,
+    conflicts: list[str],
+    low_score_reasons: list[str],
+) -> str:
+    if conflicts:
+        return "存在硬冲突"
+    if score >= strong_threshold and not low_score_reasons:
+        return "强匹配"
+    if score >= reuse_threshold:
+        return "可复用候选"
+    return "低匹配/建议新增"
 
 
 def _configured_synonyms(rules: dict[str, object]) -> dict[str, tuple[str, ...]]:
@@ -785,10 +889,16 @@ class ScenarioLibrary:
             if not matched:
                 continue
 
-            name_coverage, _ = _coverage(query, scenario.name, synonyms=synonyms)
-            tag_coverage, _ = _coverage(query, " ".join(scenario.tags), synonyms=synonyms)
+            name_coverage, name_terms = _coverage(query, scenario.name, synonyms=synonyms)
+            tag_coverage, tag_terms = _coverage(query, " ".join(scenario.tags), synonyms=synonyms)
             score = min(1.0, 0.65 * coverage + 0.25 * name_coverage + 0.10 * tag_coverage)
             if score >= min_score:
+                dimension_scores, low_score_reasons = _build_dimension_scores(
+                    {"全文": coverage, "名称": name_coverage, "标签": tag_coverage},
+                    {"全文": matched, "名称": name_terms, "标签": tag_terms},
+                    {"全文": True, "名称": bool(scenario.name), "标签": bool(scenario.tags)},
+                    {"全文": 0.65, "名称": 0.25, "标签": 0.10},
+                )
                 matches.append(
                     ScenarioMatch(
                         scenario=scenario,
@@ -799,6 +909,20 @@ class ScenarioLibrary:
                             scenario,
                             synonyms=synonyms,
                         ),
+                        base_score=round(score, 4),
+                        evaluation=_scenario_evaluation(
+                            score,
+                            reuse_threshold=_configured_threshold(
+                                rules, "scenario_reuse_threshold", _SCENARIO_REUSE_THRESHOLD
+                            ),
+                            strong_threshold=_configured_threshold(
+                                rules, "scenario_strong_threshold", _SCENARIO_STRONG_THRESHOLD
+                            ),
+                            conflicts=[],
+                            low_score_reasons=low_score_reasons,
+                        ),
+                        dimension_scores=dimension_scores,
+                        low_score_reasons=low_score_reasons,
                     )
                 )
 
@@ -867,9 +991,15 @@ class ScenarioLibrary:
                 continue
             if not matched:
                 continue
-            name_coverage, _ = _coverage(query, use_case.name, synonyms=synonyms)
+            name_coverage, name_terms = _coverage(query, use_case.name, synonyms=synonyms)
             score = min(1.0, 0.8 * coverage + 0.2 * name_coverage)
             if score >= min_score:
+                dimension_scores, low_score_reasons = _build_dimension_scores(
+                    {"行为链": coverage, "名称": name_coverage},
+                    {"行为链": matched, "名称": name_terms},
+                    {"行为链": True, "名称": bool(use_case.name)},
+                    {"行为链": 0.80, "名称": 0.20},
+                )
                 matches.append(
                     UseCaseMatch(
                         use_case=use_case,
@@ -881,6 +1011,18 @@ class ScenarioLibrary:
                             synonyms=synonyms,
                         ),
                         parent_scenario_id=scenario_id or parent_by_use_case.get(use_case.id),
+                        base_score=round(score, 4),
+                        evaluation=_scenario_evaluation(
+                            score,
+                            reuse_threshold=_configured_threshold(
+                                rules, "use_case_reuse_threshold", _USE_CASE_REUSE_THRESHOLD
+                            ),
+                            strong_threshold=_SCENARIO_STRONG_THRESHOLD,
+                            conflicts=[],
+                            low_score_reasons=low_score_reasons,
+                        ),
+                        dimension_scores=dimension_scores,
+                        low_score_reasons=low_score_reasons,
                     )
                 )
         matches.sort(key=lambda item: (-item.score, item.use_case.name))
@@ -892,6 +1034,7 @@ class ScenarioLibrary:
         *,
         top_k: int = 5,
         min_score: float = 0.0,
+        scenario_ids: set[str] | None = None,
     ) -> IRMatchResult:
         _validate_search_limits(top_k, min_score)
         rules = self.matching_rules()
@@ -922,8 +1065,11 @@ class ScenarioLibrary:
             "critical_dimensions_for_reuse",
             _CRITICAL_DIMENSIONS_FOR_REUSE,
         )
+        dimension_weights = _configured_dimension_weights(rules)
         matches: list[ScenarioMatch] = []
         for scenario in self.list_scenarios():
+            if scenario_ids is not None and scenario.id not in scenario_ids:
+                continue
             intent_query = " ".join(
                 [ir.title, ir.description, ir.what or "", ir.why or "", *ir.how]
             )
@@ -969,32 +1115,50 @@ class ScenarioLibrary:
             intent_score, intent_terms = _coverage(
                 intent_query, intent_document, synonyms=synonyms
             )
-            score = min(
-                1.0,
-                0.55 * intent_score
-                + 0.15 * actor_score
-                + 0.10 * context_score
-                + 0.10 * impact_score
-                + 0.10 * constraint_score,
+            dimension_values = {
+                "目标/行为": intent_score,
+                "Actor": actor_score,
+                "上下文": context_score,
+                "影响因素": impact_score,
+                "约束": constraint_score,
+            }
+            dimension_evidence = {
+                "目标/行为": intent_terms,
+                "Actor": actor_terms,
+                "上下文": context_terms,
+                "影响因素": impact_terms,
+                "约束": constraint_terms,
+            }
+            dimension_supplied = {
+                "目标/行为": bool(intent_query.strip()),
+                "Actor": bool(ir.who),
+                "上下文": bool(ir.when or ir.where),
+                "影响因素": bool(ir.where or ir.constraints or ir.how_much),
+                "约束": bool(ir.constraints or ir.how_much),
+            }
+            dimension_scores, low_score_reasons = _build_dimension_scores(
+                dimension_values,
+                dimension_evidence,
+                dimension_supplied,
+                dimension_weights,
             )
+            base_score = min(
+                1.0,
+                sum(item.weighted_score for item in dimension_scores.values()),
+            )
+            dimensions = [
+                name for name, dimension_score in dimension_values.items() if dimension_score > 0
+            ]
+            gaps = [
+                f"{name}未覆盖"
+                for name, dimension_score in dimension_values.items()
+                if dimension_supplied[name] and dimension_score <= 0
+            ]
 
-            dimensions: list[str] = []
-            gaps: list[str] = []
-            for name, dimension_score, supplied in (
-                ("目标/行为", intent_score, bool(intent_query.strip())),
-                ("Actor", actor_score, bool(ir.who)),
-                ("上下文", context_score, bool(ir.when or ir.where)),
-                ("影响因素", impact_score, bool(ir.where or ir.constraints or ir.how_much)),
-                ("约束", constraint_score, bool(ir.constraints or ir.how_much)),
-            ):
-                if dimension_score > 0:
-                    dimensions.append(name)
-                elif supplied:
-                    gaps.append(f"{name}未覆盖")
-
-            # A cross-field agreement is stronger evidence than raw character
-            # coverage alone, especially for long Chinese IR descriptions.
-            score = min(1.0, score + 0.04 * len(dimensions))
+            # Cross-field agreement is a small, explainable bonus.  It is
+            # reported separately so users can see where the total came from.
+            score = min(1.0, base_score + 0.04 * len(dimensions))
+            consistency_bonus = score - base_score
             if score < min_score:
                 continue
 
@@ -1025,6 +1189,17 @@ class ScenarioLibrary:
                     matched_dimensions=dimensions,
                     gaps=gaps,
                     conflicts=conflicts,
+                    base_score=round(base_score, 4),
+                    consistency_bonus=round(consistency_bonus, 4),
+                    evaluation=_scenario_evaluation(
+                        score,
+                        reuse_threshold=scenario_reuse_threshold,
+                        strong_threshold=scenario_strong_threshold,
+                        conflicts=conflicts,
+                        low_score_reasons=low_score_reasons,
+                    ),
+                    dimension_scores=dimension_scores,
+                    low_score_reasons=low_score_reasons,
                 )
             )
 
@@ -1099,6 +1274,31 @@ class ScenarioLibrary:
                 decision = "reuse_scenario_create_uc"
                 rationale.append("场景上下文可以复用，但没有足够匹配的 UC 覆盖完整行为链路。")
 
+        confidence_label = "无候选"
+        confidence_reasons: list[str] = []
+        if missing_fields:
+            confidence_label = "信息不足"
+            confidence_reasons.append("IR 缺少必填 5W2H 字段，当前分数不能作为完整匹配结论。")
+        elif top_match is None:
+            confidence_reasons.append("场景库没有返回候选 SC。")
+        elif top_match.conflicts or critical_gaps or ambiguous:
+            confidence_label = "需人工确认"
+            confidence_reasons.extend(top_match.conflicts)
+            confidence_reasons.extend(critical_gaps)
+            if ambiguous:
+                confidence_reasons.append(f"最高候选与次高候选分差仅 {score_margin:.2f}。")
+        elif top_score >= scenario_strong_threshold:
+            confidence_label = "强匹配"
+            confidence_reasons.append("总分达到强匹配线，且关键维度没有硬冲突。")
+        elif top_score >= scenario_reuse_threshold:
+            confidence_label = "候选可复用"
+            confidence_reasons.append("总分达到场景复用线，但仍建议人工核对维度分解。")
+        else:
+            confidence_label = "低分/建议新增"
+            confidence_reasons.append("最高候选未达到场景复用线。")
+        if top_match is not None:
+            confidence_reasons.extend(top_match.low_score_reasons[:3])
+
         return IRMatchResult(
             ir=ir,
             missing_ir_fields=missing_fields,
@@ -1108,8 +1308,56 @@ class ScenarioLibrary:
             confidence=round(top_score, 4),
             score_margin=score_margin,
             ambiguous=ambiguous,
+            confidence_label=confidence_label,
+            confidence_reasons=list(dict.fromkeys(confidence_reasons)),
             rationale=rationale,
         )
+
+    def evaluate_scenario_fit(
+        self,
+        ir: IRRequirementInput,
+        scenario_id: str,
+    ) -> dict[str, object]:
+        """Evaluate one explicitly selected SC without changing the library."""
+
+        scenario = self.get_scenario(scenario_id)
+        result = self.match_ir(ir, top_k=1, scenario_ids={scenario_id})
+        if not result.scenario_matches:
+            raise ValueError(f"Scenario cannot be evaluated: {scenario_id}")
+        match = result.scenario_matches[0]
+        fit_reasons = list(match.low_score_reasons)
+        fit_reasons.extend(match.gaps)
+        fit_reasons.extend(match.conflicts)
+        return {
+            "ir": ir.model_dump(mode="json"),
+            "scenario": scenario.model_dump(mode="json"),
+            "scenario_id": scenario_id,
+            "score": match.score,
+            "evaluation": match.evaluation,
+            "dimension_scores": {
+                key: value.model_dump(mode="json")
+                for key, value in match.dimension_scores.items()
+            },
+            "low_score_reasons": list(dict.fromkeys(fit_reasons)),
+            "gaps": list(match.gaps),
+            "conflicts": list(match.conflicts),
+            "use_case_matches": [
+                item.model_dump(mode="json") for item in result.use_case_matches
+            ],
+            "confidence_label": result.confidence_label,
+            "confidence_reasons": result.confidence_reasons,
+            "matching_rules": {
+                key: value
+                for key, value in self.matching_rules().items()
+                if key
+                in {
+                    "scenario_reuse_threshold",
+                    "scenario_strong_threshold",
+                    "ambiguity_margin",
+                    "ir_dimension_weights",
+                }
+            },
+        }
 
     def create(self, request: CreateScenarioRequest) -> Scenario:
         with self._lock:

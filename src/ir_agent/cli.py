@@ -109,6 +109,28 @@ def _format_match_fields(fields: object) -> str:
     return "；".join(parts)
 
 
+def _format_dimension_scores(scores: object) -> list[str]:
+    if not isinstance(scores, dict) or not scores:
+        return ["  维度评分：暂无"]
+    lines: list[str] = []
+    for label, detail in scores.items():
+        if not isinstance(detail, dict):
+            continue
+        evidence = detail.get("evidence") or []
+        evidence_values = [str(value) for value in evidence]
+        evidence_text = "、".join(evidence_values[:12]) or "无"
+        if len(evidence_values) > 12:
+            evidence_text += f"等{len(evidence_values)}项"
+        lines.append(
+            f"  {label}：{float(detail.get('score', 0.0) or 0.0):.2f} × "
+            f"权重 {float(detail.get('weight', 0.0) or 0.0):.2f} = "
+            f"{float(detail.get('weighted_score', 0.0) or 0.0):.2f}；"
+            f"{detail.get('level', '未评价')}；证据：{evidence_text}；"
+            f"{detail.get('reason', '')}"
+        )
+    return lines or ["  维度评分：暂无"]
+
+
 def _print_result(
     result,
     *,
@@ -124,6 +146,18 @@ def _print_result(
         if resolution.ir_id:
             print(f"IR：{resolution.ir_id}")
         print(f"需求理解：{resolution.request_summary}")
+        matching = report.get("matching") or {}
+        if matching:
+            print(
+                f"匹配评价：{matching.get('confidence_label', '未评价')} "
+                f"（分数信号 {float(matching.get('confidence', 0.0) or 0.0):.2f}）"
+            )
+            for reason in matching.get("confidence_reasons") or []:
+                print(f"置信度原因：{reason}")
+            if matching.get("ambiguous"):
+                print(
+                    f"候选分差：{float(matching.get('score_margin', 0.0) or 0.0):.2f}（需人工确认）"
+                )
         if resolution.candidates:
             candidates = "、".join(
                 f"{item.scenario_id}({item.score:.2f})" for item in resolution.candidates
@@ -134,6 +168,15 @@ def _print_result(
                 f"SC匹配依据：{item['id']} {item['name']} -> "
                 f"{_format_match_fields(item.get('matched_fields'))}"
             )
+            print(
+                f"  评分构成：基础分 {float(item.get('base_score', 0.0) or 0.0):.2f} + "
+                f"一致性加分 {float(item.get('consistency_bonus', 0.0) or 0.0):.2f} "
+                f"= {float(item.get('score', 0.0) or 0.0):.2f}；"
+                f"评价：{item.get('evaluation', '未评价')}"
+            )
+            print("\n".join(_format_dimension_scores(item.get("dimension_scores"))))
+            if item.get("low_score_reasons"):
+                print(f"  低分原因：{'；'.join(item['low_score_reasons'])}")
             if item.get("gaps"):
                 print(f"  未覆盖：{'；'.join(item['gaps'])}")
             if item.get("conflicts"):
@@ -148,6 +191,26 @@ def _print_result(
                 f"（父 SC：{item.get('parent_scenario_id') or '未解析'}） -> "
                 f"{_format_match_fields(item.get('matched_fields'))}"
             )
+            print(
+                f"  评分构成：基础分 {float(item.get('base_score', 0.0) or 0.0):.2f} + "
+                f"一致性加分 {float(item.get('consistency_bonus', 0.0) or 0.0):.2f} "
+                f"= {float(item.get('score', 0.0) or 0.0):.2f}；"
+                f"评价：{item.get('evaluation', '未评价')}"
+            )
+            print("\n".join(_format_dimension_scores(item.get("dimension_scores"))))
+            if item.get("low_score_reasons"):
+                print(f"  低分原因：{'；'.join(item['low_score_reasons'])}")
+        for evaluation in report.get("evaluations", {}).get("scenario_fit", []):
+            scenario = evaluation.get("scenario") or {}
+            print(
+                f"指定 SC 符合度：{evaluation.get('scenario_id', scenario.get('id', '-'))} "
+                f"{scenario.get('name', '')} -> "
+                f"{float(evaluation.get('score', 0.0) or 0.0):.2f} "
+                f"（{evaluation.get('evaluation', '未评价')}）"
+            )
+            print("\n".join(_format_dimension_scores(evaluation.get("dimension_scores"))))
+            if evaluation.get("low_score_reasons"):
+                print(f"  低分原因：{'；'.join(evaluation['low_score_reasons'])}")
         for relationship in report.get("use_cases", {}).get("by_scenario", []):
             print(
                 f"SC→UC：{relationship['scenario_id']} "
@@ -366,8 +429,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.json_output:
                 print(f"结果目录：{output_path.parent}", file=sys.stderr)
+                print(f"CSV评估目录：{output_path.parent / 'evaluation'}", file=sys.stderr)
             else:
                 print(f"结果目录：{output_path.parent}")
+                print(f"CSV评估目录：{output_path.parent / 'evaluation'}")
         except OSError as exc:
             print(f"结果报告保存失败：{exc}", file=sys.stderr)
         if session_store is not None:

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ir_agent.domain import IRRequirementInput
 from ir_agent.library import ScenarioLibrary
 from ir_agent.specs import SpecCatalog
 from ir_agent.tools import ToolRegistry
@@ -28,6 +29,7 @@ class ToolRegistryTests(unittest.TestCase):
             {definition["name"] for definition in definitions},
             {
                 "match_ir_requirement",
+                "evaluate_scenario_fit",
                 "draft_scenario_from_ir",
                 "draft_use_cases_from_ir",
                 "save_ir_requirement",
@@ -117,6 +119,22 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["match"]["decision"], "needs_clarification")
         self.assertIn("who", result["match"]["missing_ir_fields"])
+
+    def test_evaluate_scenario_fit_tool_is_read_only_and_explainable(self) -> None:
+        stored = self.registry.library.get_requirement("IR-XXXX-001")
+        ir = IRRequirementInput.model_validate(
+            stored.model_dump(exclude={"id", "created_at", "updated_at"})
+        ).model_dump(mode="json")
+
+        result = self.registry.execute(
+            "evaluate_scenario_fit",
+            {"ir": ir, "scenario_id": "SCN-XXXX-001"},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["evaluation"]["scenario_id"], "SCN-XXXX-001")
+        self.assertIn("目标/行为", result["evaluation"]["dimension_scores"])
+        self.assertEqual(result["evaluation"]["matching_rules"]["scenario_reuse_threshold"], 0.45)
 
     def test_standalone_scenario_match_recommends_reuse(self) -> None:
         result = self.registry.execute(

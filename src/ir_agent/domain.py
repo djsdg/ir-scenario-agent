@@ -143,6 +143,19 @@ class Scenario(BaseModel):
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
+class DimensionScore(BaseModel):
+    """Explain one deterministic matching dimension for human review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: float = Field(ge=0.0, le=1.0)
+    weight: float = Field(ge=0.0, le=1.0)
+    weighted_score: float = Field(ge=0.0, le=1.0)
+    level: Literal["strong", "partial", "weak", "missing", "not_provided", "conflict"]
+    evidence: list[str] = Field(default_factory=list, max_length=100)
+    reason: str = Field(default="", max_length=2_000)
+
+
 class ScenarioMatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -153,6 +166,11 @@ class ScenarioMatch(BaseModel):
     matched_dimensions: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
+    base_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    consistency_bonus: float = Field(default=0.0, ge=0.0, le=1.0)
+    evaluation: str = Field(default="未评价", max_length=100)
+    dimension_scores: dict[str, DimensionScore] = Field(default_factory=dict)
+    low_score_reasons: list[str] = Field(default_factory=list, max_length=100)
 
 
 class UseCaseMatch(BaseModel):
@@ -163,6 +181,11 @@ class UseCaseMatch(BaseModel):
     matched_terms: list[str] = Field(default_factory=list)
     matched_fields: dict[str, list[str]] = Field(default_factory=dict)
     parent_scenario_id: str | None = None
+    base_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    consistency_bonus: float = Field(default=0.0, ge=0.0, le=1.0)
+    evaluation: str = Field(default="未评价", max_length=100)
+    dimension_scores: dict[str, DimensionScore] = Field(default_factory=dict)
+    low_score_reasons: list[str] = Field(default_factory=list, max_length=100)
 
 
 class IRMatchResult(BaseModel):
@@ -176,6 +199,8 @@ class IRMatchResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     score_margin: float = Field(default=0.0, ge=0.0, le=1.0)
     ambiguous: bool = False
+    confidence_label: str = Field(default="未评价", max_length=100)
+    confidence_reasons: list[str] = Field(default_factory=list, max_length=100)
     rationale: list[str]
 
 

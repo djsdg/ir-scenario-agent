@@ -308,7 +308,7 @@ DEFAULT_INSTRUCTIONS = """
 
 工作规则：
 1. 从 IR 原文抽取 code/title/description/source、Who/When/Where/What/How/Why/How Much、约束和 DFX。原文为空的字段使用 null 或空数组，不得猜测。
-2. 有完整 IR 时必须先调用 match_ir_requirement；如果用户只提供 SC 描述，调用 match_scenario；如果只提供 UC 行为链，调用 match_use_case；只有需要原始候选列表的零散查询才调用 search_scenarios 或 search_use_cases。不要凭记忆声称场景或 UC 存在。
+2. 有完整 IR 时必须先调用 match_ir_requirement；如果用户只提供 SC 描述，调用 match_scenario；如果只提供 UC 行为链，调用 match_use_case；如果用户指定某个 SC 做符合度/测试评估，调用 evaluate_scenario_fit；只有需要原始候选列表的零散查询才调用 search_scenarios 或 search_use_cases。不要凭记忆声称场景或 UC 存在。
 3. 匹配必须同时检查：目标与故障表现、Actor、生命周期/上下文、影响因素/部件、约束，以及 UC 的触发→处理→保证链路；最终说明每个 SC/UC 实际命中了哪些字段和证据词，不要只报分数。
 4. match_ir_requirement 的 decision 有四种：reuse_scenario_and_uc、reuse_scenario_create_uc、create_scenario_and_uc、needs_clarification。遵循工具结论，并说明差异；如果工具返回硬冲突或 ambiguous=true，不得自动复用，必须请求人工确认。
 5. 场景必须遵循当前 active_business_spec：description、category、business_goal、actor、actions、influence_factors、lifecycle、constraints、owner 都要有；每个 influence_factor 必须有 kind、dimension、name 和至少一个 selected_value。缺任一项时不得调用 create_scenario。
@@ -318,7 +318,7 @@ DEFAULT_INSTRUCTIONS = """
 9. 若复用场景但现有 UC 不覆盖新的触发或处理分支，只在该场景下新增 UC；仅当场景上下文、Actor、生命周期或影响因素不兼容时才新增场景。
 10. 没有可复用 SC 时，若用户明确要求新增，先用 draft_scenario_from_ir 和 draft_use_cases_from_ir 补齐，再分别调用 create_scenario/create_use_case；已有 SC/UC 需要修订时调用 update_scenario/update_use_case，直接更新当前场景库，不能只在输出里伪造一份新记录。
 11. 一个 SC 下如果匹配或新建多个 UC，逐个列出 UC 编号、父 SC、触发事件/主成功场景/保证命中情况；不得把多个 UC 合并成一个模糊条目。
-12. 只使用工具返回的真实 id，不得编造；工具报错时修正参数或列出待补字段，不得假装成功。
+12. 只使用本轮成功匹配工具返回的真实 id，不得仅因为编号存在于库中就声称匹配；如果本轮没有成功调用 match_ir_requirement、match_scenario、match_use_case 或 evaluate_scenario_fit，任何 matched/reuse/created 结论都必须改为 needs_clarification。工具报错时修正参数或列出待补字段，不得假装成功。
 13. 最终输出必须符合 response text schema 的 JSON，不输出 Markdown。没有新增时 created_scenario_id 为 null，created_use_case_ids 为空数组。
 14. 最终 JSON 的 request_summary、reason、gaps、missing_required_fields 和 next_steps 使用中文，事实与推断分开。
 
@@ -831,6 +831,7 @@ class IRScenarioAgent:
                     records,
                     known_scenario_ids={item.id for item in self.library.list_scenarios()},
                     known_use_case_ids={item.id for item in self.library.list_use_cases()},
+                    require_matching_tool=True,
                 )
                 safe_output_text = text
                 if parsed_resolution is not None and resolution != parsed_resolution:
@@ -1000,8 +1001,17 @@ def _guard_resolution_facts(
     *,
     known_scenario_ids: set[str] | None = None,
     known_use_case_ids: set[str] | None = None,
+    require_matching_tool: bool = False,
 ) -> ScenarioResolution | None:
-    """Prevent a structured final answer from inventing library/tool-backed IDs."""
+    """Prevent a structured final answer from inventing library/tool-backed facts.
+
+    ``known_*_ids`` are useful for the legacy, direct helper use case, but they
+    are not sufficient provenance for an Agent run: an existing ID can still
+    be the wrong match.  When ``require_matching_tool`` is enabled, candidate
+    and selected IDs must come from a successful authoritative match tool in
+    this run, and a decisive resolution without such a call is downgraded to
+    ``needs_clarification``.
+    """
 
     if resolution is None:
         return None
@@ -1010,6 +1020,10 @@ def _guard_resolution_facts(
     use_case_ids: set[str] = set(known_use_case_ids or ())
     created_scenario_ids: set[str] = set()
     created_use_case_ids: set[str] = set()
+
+    matching_scenario_ids, matching_use_case_ids, matching_tool_names = (
+        _matching_tool_facts(records)
+    )
 
     def collect(value: Any) -> None:
         if isinstance(value, list):
@@ -1046,24 +1060,51 @@ def _guard_resolution_facts(
             if isinstance(use_case, dict) and use_case.get("id"):
                 created_use_case_ids.add(str(use_case["id"]))
 
+    has_decisive_claim = bool(
+        resolution.status in {"matched", "created"}
+        or resolution.decision != "needs_clarification"
+        or resolution.candidates
+        or resolution.selected_scenario_ids
+        or resolution.use_case_ids
+        or resolution.created_scenario_id
+        or resolution.created_use_case_ids
+    )
+    missing_matching_tool = bool(
+        require_matching_tool and has_decisive_claim and not matching_tool_names
+    )
+
     has_known_catalog = known_scenario_ids is not None or known_use_case_ids is not None
-    if not scenario_ids and not use_case_ids and not has_known_catalog:
+    if (
+        not scenario_ids
+        and not use_case_ids
+        and not has_known_catalog
+        and not missing_matching_tool
+    ):
         return resolution
+
+    if require_matching_tool:
+        candidate_scenario_ids = set(matching_scenario_ids)
+        selected_scenario_ids = candidate_scenario_ids | created_scenario_ids
+        valid_use_case_ids = set(matching_use_case_ids) | created_use_case_ids
+    else:
+        candidate_scenario_ids = scenario_ids
+        selected_scenario_ids = scenario_ids
+        valid_use_case_ids = use_case_ids
 
     invalid_candidates = [
         item.scenario_id
         for item in resolution.candidates
-        if item.scenario_id not in scenario_ids
+        if item.scenario_id not in candidate_scenario_ids
     ]
     invalid_selected = [
         scenario_id
         for scenario_id in resolution.selected_scenario_ids
-        if scenario_id not in scenario_ids
+        if scenario_id not in selected_scenario_ids
     ]
     invalid_use_cases = [
         use_case_id
         for use_case_id in resolution.use_case_ids
-        if use_case_id not in use_case_ids
+        if use_case_id not in valid_use_case_ids
     ]
     invalid_created_scenario = bool(
         resolution.created_scenario_id
@@ -1081,6 +1122,7 @@ def _guard_resolution_facts(
             invalid_use_cases,
             invalid_created_scenario,
             invalid_created_use_cases,
+            missing_matching_tool,
         ]
     ):
         return resolution
@@ -1099,9 +1141,15 @@ def _guard_resolution_facts(
             "新建 UC 编号没有对应的 create_use_case 工具结果："
             + "、".join(_unique_strings(invalid_created_use_cases))
         )
+    if missing_matching_tool:
+        issues.append(
+            "本轮没有成功调用场景/UC 匹配工具，匹配结论不能作为事实。"
+        )
 
     valid_candidates = [
-        item for item in resolution.candidates if item.scenario_id in scenario_ids
+        item
+        for item in resolution.candidates
+        if item.scenario_id in candidate_scenario_ids
     ]
     return resolution.model_copy(
         update={
@@ -1111,12 +1159,12 @@ def _guard_resolution_facts(
             "selected_scenario_ids": [
                 scenario_id
                 for scenario_id in resolution.selected_scenario_ids
-                if scenario_id in scenario_ids
+                if scenario_id in selected_scenario_ids
             ],
             "use_case_ids": [
                 use_case_id
                 for use_case_id in resolution.use_case_ids
-                if use_case_id in use_case_ids
+                if use_case_id in valid_use_case_ids
             ],
             "created_scenario_id": (
                 resolution.created_scenario_id
@@ -1135,6 +1183,56 @@ def _guard_resolution_facts(
             ),
         }
     )
+
+
+def _matching_tool_facts(
+    records: list[ToolCallRecord],
+) -> tuple[set[str], set[str], set[str]]:
+    """Extract candidate IDs from successful authoritative match calls only."""
+
+    authoritative_tools = {
+        "match_ir_requirement",
+        "match_scenario",
+        "match_use_case",
+        "evaluate_scenario_fit",
+    }
+    scenario_ids: set[str] = set()
+    use_case_ids: set[str] = set()
+    tool_names: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+            return
+        if not isinstance(value, dict):
+            return
+
+        scenario = value.get("scenario")
+        if isinstance(scenario, dict) and scenario.get("id"):
+            scenario_ids.add(str(scenario["id"]))
+        use_case = value.get("use_case")
+        if isinstance(use_case, dict):
+            if use_case.get("id"):
+                use_case_ids.add(str(use_case["id"]))
+            if use_case.get("scenario_id"):
+                scenario_ids.add(str(use_case["scenario_id"]))
+        for key in ("scenario_id", "parent_scenario_id"):
+            identifier = value.get(key)
+            if isinstance(identifier, str) and identifier.strip():
+                scenario_ids.add(identifier)
+        for child in value.values():
+            collect(child)
+
+    for record in records:
+        if record.name not in authoritative_tools:
+            continue
+        if record.result.get("ok") is False:
+            continue
+        tool_names.add(record.name)
+        collect(record.result)
+
+    return scenario_ids, use_case_ids, tool_names
 
 
 def _unique_strings(values: list[str]) -> list[str]:

@@ -540,6 +540,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                                 )
                                 with Horizontal(id="candidate-actions"):
                                     yield Button("加入当前选择", id="add-selection", variant="primary")
+                                    yield Button("评估当前 SC", id="evaluate-scenario")
                                     yield Button("填充确认/编辑提示", id="prepare-selection")
                                     yield Button("确认选择并发送", id="confirm-selection", variant="success")
                                     yield Button("检查库质量", id="validate-library")
@@ -590,6 +591,15 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         f"歧义分差：{self._rule_number(matching_rules, 'ambiguity_margin', 0.08):.2f}",
                     ]
                 )
+                dimension_weights = matching_rules.get("ir_dimension_weights")
+                if isinstance(dimension_weights, dict):
+                    config_lines.append(
+                        "SC维度权重："
+                        + "；".join(
+                            f"{key} {self._rule_number(dimension_weights, key, 0.0):.2f}"
+                            for key in ("目标/行为", "Actor", "上下文", "影响因素", "约束")
+                        )
+                    )
             self.query_one("#config", _CopyableTextArea).update("\n".join(config_lines))
             path_lines = [
                 f"场景库：{self.agent.library.path.resolve()}",
@@ -647,6 +657,8 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 self._set_input_meta("输入区已清空。")
             elif button_id == "add-selection":
                 self._add_current_selection()
+            elif button_id == "evaluate-scenario":
+                self._evaluate_current_scenario()
             elif button_id == "prepare-selection":
                 self._prepare_selection_prompt(auto_submit=False)
             elif button_id == "confirm-selection":
@@ -751,6 +763,24 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self._set_input_meta("已填充人工选择提示，可继续编辑后发送。")
             if auto_submit:
                 self._submit(prompt, source="TUI 人工确认")
+
+        def _evaluate_current_scenario(self) -> None:
+            """Ask the agent to run the deterministic fit check for the highlighted SC."""
+            if self._busy or self._path_loading:
+                self.notify("上一条请求还在处理中，请稍候。", severity="warning")
+                return
+            if not self._current_scenario_id:
+                self.notify("请先点击 SC 候选表格中的一行。", severity="warning")
+                return
+            prompt = (
+                "请对当前选中的场景做只读符合度评估。\n"
+                f"指定 SC 编号：{self._current_scenario_id}\n"
+                "请从当前 IR/需求上下文中提取完整字段，必须调用 evaluate_scenario_fit，"
+                "展示总分、每个维度分数、证据、低分原因、缺口和冲突；不要执行任何写入。"
+            )
+            self.query_one("#prompt", TextArea).text = prompt
+            self._set_input_meta("已填充指定 SC 评估提示；评估是只读操作，不会更新场景库。")
+            self._submit(prompt, source="TUI 指定 SC 符合度评估")
 
         def _validate_library_direct(self) -> None:
             if self._busy or self._path_loading:
@@ -1082,13 +1112,31 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     f"决策：{resolution.decision}",
                     f"需求理解：{resolution.request_summary}",
                 ]
-                if resolution.candidates:
+                matching = report.get("matching") or {}
+                if matching:
+                    lines.append(
+                        f"匹配评价：{matching.get('confidence_label', '未评价')} "
+                        f"（分数信号 {float(matching.get('confidence', 0.0) or 0.0):.2f}）"
+                    )
+                    confidence_reasons = matching.get("confidence_reasons") or []
+                    if confidence_reasons:
+                        lines.append("置信度原因：" + "；".join(str(item) for item in confidence_reasons))
+                    if matching.get("ambiguous"):
+                        lines.append(
+                            f"候选分差：{float(matching.get('score_margin', 0.0) or 0.0):.2f}（需人工确认）"
+                        )
+                scenario_evidence = report.get("scenarios", {}).get("matches", [])
+                candidate_summary_rows = scenario_evidence or resolution.candidates
+                if candidate_summary_rows:
                     candidates = "、".join(
-                        f"{item.scenario_id}({item.score:.2f})"
-                        for item in resolution.candidates
+                        (
+                            f"{item.get('id')}({float(item.get('score', 0.0) or 0.0):.2f})"
+                            if isinstance(item, dict)
+                            else f"{item.scenario_id}({item.score:.2f})"
+                        )
+                        for item in candidate_summary_rows
                     )
                     lines.append(f"候选场景：{candidates}")
-                scenario_evidence = report.get("scenarios", {}).get("matches", [])
                 if scenario_evidence:
                     lines.append("SC 匹配依据：")
                     for item in scenario_evidence:
@@ -1110,6 +1158,20 @@ if _TEXTUAL_IMPORT_ERROR is None:
                             f"- {item['id']}（父 SC：{parent}）："
                             f"{self._format_match_fields(item.get('matched_fields'))}"
                         )
+                evaluations = report.get("evaluations", {}).get("scenario_fit", [])
+                if evaluations:
+                    lines.append("指定 SC 符合度评估：")
+                    for evaluation in evaluations:
+                        scenario = evaluation.get("scenario") or {}
+                        lines.append(
+                            f"- {evaluation.get('scenario_id', scenario.get('id', '-'))} "
+                            f"{scenario.get('name', '')}："
+                            f"{float(evaluation.get('score', 0.0) or 0.0):.2f} "
+                            f"（{evaluation.get('evaluation', '未评价')}）"
+                        )
+                        reasons = evaluation.get("low_score_reasons") or []
+                        if reasons:
+                            lines.append("  低分原因：" + "；".join(str(item) for item in reasons))
                 for relationship in report.get("use_cases", {}).get("by_scenario", []):
                     lines.append(
                         f"SC→UC：{relationship['scenario_id']} "
@@ -1146,6 +1208,10 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     f"决策：{resolution.decision}",
                     f"匹配分数（非概率）：{resolution.confidence:.2f}",
                 ]
+                if matching:
+                    summary_lines.append(
+                        f"匹配评价：{matching.get('confidence_label', '未评价')}"
+                    )
                 ambiguous = bool(getattr(resolution, "ambiguous", False))
                 score_margin = float(getattr(resolution, "score_margin", 0.0) or 0.0)
                 for call in result.tool_calls:
@@ -1170,31 +1236,81 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     )
                 if output_path:
                     summary_lines.append(f"输出：{output_path}")
+                    summary_lines.append(f"CSV评估目录：{output_path.parent / 'evaluation'}")
                 self.query_one("#result-summary", _CopyableTextArea).update("\n".join(summary_lines))
 
-                if not resolution.candidates:
-                    self.candidates_log.write("模型没有返回结构化候选场景。")
                 candidate_details = self._match_candidate_details(result)
-                for index, candidate in enumerate(resolution.candidates, start=1):
-                    details = candidate_details.get(candidate.scenario_id, {})
-                    scenario_name = self._scenario_name(candidate.scenario_id)
+                resolution_candidates = {
+                    candidate.scenario_id: candidate for candidate in resolution.candidates
+                }
+                candidate_rows: list[dict[str, Any]] = [
+                    dict(item)
+                    for item in scenario_evidence
+                    if isinstance(item, dict) and item.get("id")
+                ]
+                if not candidate_rows:
+                    candidate_rows = [
+                        {
+                            "id": candidate.scenario_id,
+                            "score": candidate.score,
+                            "matched_dimensions": candidate.matched_dimensions,
+                            "gaps": candidate.gaps,
+                            "reason": candidate.reason,
+                        }
+                        for candidate in resolution.candidates
+                    ]
+                if not candidate_rows:
+                    self.candidates_log.write("本轮没有结构化候选场景。")
+                for index, candidate_row in enumerate(candidate_rows, start=1):
+                    scenario_id = str(candidate_row["id"])
+                    fallback_candidate = resolution_candidates.get(scenario_id)
+                    details = dict(candidate_details.get(scenario_id, {}))
+                    details.update(candidate_row)
+                    scenario_name = str(
+                        details.get("name") or self._scenario_name(scenario_id)
+                    )
+                    score = float(details.get("score", 0.0) or 0.0)
+                    matched_dimensions = details.get("matched_dimensions") or (
+                        fallback_candidate.matched_dimensions if fallback_candidate else []
+                    )
+                    gaps = details.get("gaps") or (
+                        fallback_candidate.gaps if fallback_candidate else []
+                    )
                     conflicts = details.get("conflicts", [])
                     self.candidate_table.add_row(
                         str(index),
-                        candidate.scenario_id,
+                        scenario_id,
                         self._clip(scenario_name, 34),
-                        f"{candidate.score:.2f}",
-                        self._clip("、".join(candidate.matched_dimensions) or "-"),
-                        self._clip("；".join(candidate.gaps) or "-"),
+                        f"{score:.2f}",
+                        self._clip(str(details.get("evaluation") or "未评价"), 16),
+                        self._clip("、".join(str(item) for item in matched_dimensions) or "-"),
+                        self._clip("；".join(details.get("low_score_reasons", [])) or "-", 42),
+                        self._clip("；".join(str(item) for item in gaps) or "-"),
                         self._clip("；".join(conflicts) or "-"),
-                        key=candidate.scenario_id,
+                        key=scenario_id,
                     )
                     self.candidates_log.write(
-                        f"{index}. {candidate.scenario_id} | 分数 {candidate.score:.2f}"
+                        f"{index}. {scenario_id} | 分数 {score:.2f}"
                     )
-                    if candidate.matched_dimensions:
+                    if details.get("evaluation"):
+                        self.candidates_log.write(f"   评价：{details['evaluation']}")
+                    base_score = float(details.get("base_score", 0.0) or 0.0)
+                    consistency_bonus = float(details.get("consistency_bonus", 0.0) or 0.0)
+                    self.candidates_log.write(
+                        f"   评分构成：基础分 {base_score:.2f} + "
+                        f"一致性加分 {consistency_bonus:.2f} = {score:.2f}"
+                    )
+                    for dimension_line in self._format_dimension_scores(
+                        details.get("dimension_scores")
+                    ):
+                        self.candidates_log.write("   " + dimension_line)
+                    if details.get("low_score_reasons"):
                         self.candidates_log.write(
-                            "   命中：" + "、".join(candidate.matched_dimensions)
+                            "   低分原因：" + "；".join(details["low_score_reasons"])
+                        )
+                    if matched_dimensions:
+                        self.candidates_log.write(
+                            "   命中：" + "、".join(str(item) for item in matched_dimensions)
                         )
                     matched_fields = details.get("matched_fields", {})
                     if matched_fields:
@@ -1205,12 +1321,32 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         self.candidates_log.write(
                             "   命中词：" + "、".join(details["matched_terms"])
                         )
-                    if candidate.gaps:
-                        self.candidates_log.write("   缺口：" + "；".join(candidate.gaps))
+                    if gaps:
+                        self.candidates_log.write(
+                            "   缺口：" + "；".join(str(item) for item in gaps)
+                        )
                     if conflicts:
                         self.candidates_log.write("   冲突：" + "；".join(conflicts))
-                    self.candidates_log.write(f"   原因：{candidate.reason}")
+                    reason = str(details.get("reason") or "工具返回的匹配候选")
+                    self.candidates_log.write(f"   原因：{reason}")
                 self._write_use_case_candidates(result)
+                for evaluation in report.get("evaluations", {}).get("scenario_fit", []):
+                    scenario = evaluation.get("scenario") or {}
+                    scenario_id = evaluation.get("scenario_id") or scenario.get("id", "-")
+                    self.candidates_log.write(
+                        f"指定 SC 评估 {scenario_id} | "
+                        f"分数 {float(evaluation.get('score', 0.0) or 0.0):.2f} | "
+                        f"评价 {evaluation.get('evaluation', '未评价')}"
+                    )
+                    for dimension_line in self._format_dimension_scores(
+                        evaluation.get("dimension_scores")
+                    ):
+                        self.candidates_log.write("   " + dimension_line)
+                    reasons = evaluation.get("low_score_reasons") or []
+                    if reasons:
+                        self.candidates_log.write(
+                            "   原因：" + "；".join(str(item) for item in reasons)
+                        )
 
             if output_path is not None:
                 self.conversation.write(f"输出文件：{output_path}")
@@ -1232,10 +1368,22 @@ if _TEXTUAL_IMPORT_ERROR is None:
         def _reset_candidate_table(self) -> None:
             table = self.candidate_table
             table.clear(columns=True)
-            table.add_columns("序号", "SC", "场景名称", "分数", "命中维度", "缺口", "冲突")
+            table.add_columns(
+                "序号",
+                "SC",
+                "场景名称",
+                "分数",
+                "评价",
+                "命中维度",
+                "低分原因",
+                "缺口",
+                "冲突",
+            )
             use_case_table = self.use_case_table
             use_case_table.clear(columns=True)
-            use_case_table.add_columns("序号", "UC", "用例名称", "分数", "父 SC", "命中词")
+            use_case_table.add_columns(
+                "序号", "UC", "用例名称", "分数", "评价", "父 SC", "低分原因", "命中词"
+            )
 
         def _write_use_case_candidates(self, result: Any) -> None:
             report = build_analysis_report(
@@ -1244,7 +1392,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             )
             raw_matches = report.get("use_cases", {}).get("matches", [])
             seen: set[str] = set()
-            rows: list[tuple[str, str, str, str, str]] = []
+            rows: list[tuple[str, str, str, str, str, str, str]] = []
             for item in raw_matches:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
@@ -1254,12 +1402,18 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 seen.add(use_case_id)
                 parent_id = str(item.get("parent_scenario_id") or "-")
                 matched_terms = item.get("matched_terms", [])
+                low_score_reasons = item.get("low_score_reasons", [])
                 rows.append(
                     (
                         use_case_id,
                         str(item.get("name") or use_case_id),
                         f"{float(item.get('score', 0.0) or 0.0):.2f}",
+                        str(item.get("evaluation") or "未评价"),
                         parent_id,
+                        self._clip(
+                            "；".join(str(value) for value in low_score_reasons) or "-",
+                            42,
+                        ),
                         self._clip("、".join(str(value) for value in matched_terms) or "-"),
                     )
                 )
@@ -1267,7 +1421,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             if not rows:
                 self.candidates_log.write("本轮没有结构化 UC 候选。")
                 return
-            for index, (use_case_id, name, score, parent_id, matched_terms) in enumerate(
+            for index, (use_case_id, name, score, evaluation, parent_id, low_score_reasons, matched_terms) in enumerate(
                 rows, start=1
             ):
                 self.use_case_table.add_row(
@@ -1275,20 +1429,47 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     use_case_id,
                     self._clip(name, 34),
                     score,
+                    self._clip(evaluation, 16),
                     parent_id,
+                    low_score_reasons,
                     matched_terms,
                     key=use_case_id,
                 )
+                self.candidates_log.write(
+                    f"UC {use_case_id} | 分数 {score} | 评价 {evaluation} | 父 SC {parent_id}"
+                )
+                item = next(
+                    candidate
+                    for candidate in raw_matches
+                    if isinstance(candidate, dict) and str(candidate.get("id")) == use_case_id
+                )
+                base_score = float(item.get("base_score", 0.0) or 0.0)
+                consistency_bonus = float(item.get("consistency_bonus", 0.0) or 0.0)
+                self.candidates_log.write(
+                    f"   评分构成：基础分 {base_score:.2f} + "
+                    f"一致性加分 {consistency_bonus:.2f} = {score}"
+                )
+                for dimension_line in self._format_dimension_scores(
+                    item.get("dimension_scores")
+                ):
+                    self.candidates_log.write("   " + dimension_line)
+                if low_score_reasons != "-":
+                    self.candidates_log.write(f"   低分原因：{low_score_reasons}")
 
         def _match_candidate_details(self, result: Any) -> dict[str, dict[str, Any]]:
             details: dict[str, dict[str, Any]] = {}
             for call in result.tool_calls:
-                if call.name != "match_ir_requirement":
+                if call.name not in {"match_ir_requirement", "match_scenario"}:
                     continue
-                payload = call.result.get("match")
+                payload = call.result.get("match") if call.name == "match_ir_requirement" else call.result
                 if not isinstance(payload, dict):
                     continue
-                for item in payload.get("scenario_matches", []):
+                raw_matches = (
+                    payload.get("scenario_matches", [])
+                    if call.name == "match_ir_requirement"
+                    else payload.get("matches", [])
+                )
+                for item in raw_matches:
                     if not isinstance(item, dict):
                         continue
                     scenario = item.get("scenario")
@@ -1304,6 +1485,15 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         },
                         "matched_terms": [
                             str(value) for value in item.get("matched_terms", [])
+                        ],
+                        "base_score": float(item.get("base_score", 0.0) or 0.0),
+                        "consistency_bonus": float(
+                            item.get("consistency_bonus", 0.0) or 0.0
+                        ),
+                        "evaluation": str(item.get("evaluation") or "未评价"),
+                        "dimension_scores": item.get("dimension_scores") or {},
+                        "low_score_reasons": [
+                            str(value) for value in item.get("low_score_reasons", [])
                         ],
                     }
             return details
@@ -1337,6 +1527,28 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 terms = values if isinstance(values, list) else [values]
                 parts.append(f"{key}[{'、'.join(str(value) for value in terms)}]")
             return "；".join(parts)
+
+        @staticmethod
+        def _format_dimension_scores(scores: object) -> list[str]:
+            if not isinstance(scores, dict) or not scores:
+                return ["维度评分：暂无"]
+            lines: list[str] = []
+            for label, detail in scores.items():
+                if not isinstance(detail, dict):
+                    continue
+                evidence = detail.get("evidence") or []
+                evidence_values = [str(value) for value in evidence]
+                evidence_text = "、".join(evidence_values[:12]) or "无"
+                if len(evidence_values) > 12:
+                    evidence_text += f"等{len(evidence_values)}项"
+                lines.append(
+                    f"维度 {label}：{float(detail.get('score', 0.0) or 0.0):.2f} × "
+                    f"权重 {float(detail.get('weight', 0.0) or 0.0):.2f} = "
+                    f"{float(detail.get('weighted_score', 0.0) or 0.0):.2f}；"
+                    f"{detail.get('level', '未评价')}；证据：{evidence_text}；"
+                    f"{detail.get('reason', '')}"
+                )
+            return lines or ["维度评分：暂无"]
 
         def _save_result(self, result: Any) -> Path | None:
             if self.settings is None or self.session is None:
@@ -1378,6 +1590,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
         def _set_submit_buttons(self, disabled: bool) -> None:
             self.query_one("#send", Button).disabled = disabled
             self.query_one("#send-paths", Button).disabled = disabled
+            self.query_one("#evaluate-scenario", Button).disabled = disabled
 
         def _set_status(self, text: str) -> None:
             self.query_one("#status", Static).update(f"状态：{text}")

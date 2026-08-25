@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import csv
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,8 @@ def _list(value: Any) -> list[Any]:
 
 
 def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value else []
     return [str(item) for item in _list(value) if item is not None and str(item)]
 
 
@@ -37,6 +40,16 @@ def _merge_fields(left: dict[str, list[str]], right: Any) -> dict[str, list[str]
         name = str(key)
         merged[name] = _merge_strings(merged.get(name, []), value)
     return merged
+
+
+def _dimension_scores(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): dict(item)
+        for key, item in value.items()
+        if isinstance(item, dict)
+    }
 
 
 def _normalize_scenario_match(item: Any, *, source: str) -> dict[str, Any] | None:
@@ -56,6 +69,11 @@ def _normalize_scenario_match(item: Any, *, source: str) -> dict[str, Any] | Non
         "matched_dimensions": _string_list(_value(item, "matched_dimensions")),
         "gaps": _string_list(_value(item, "gaps")),
         "conflicts": _string_list(_value(item, "conflicts")),
+        "base_score": float(_value(item, "base_score", 0.0) or 0.0),
+        "consistency_bonus": float(_value(item, "consistency_bonus", 0.0) or 0.0),
+        "evaluation": str(_value(item, "evaluation") or "未评价"),
+        "dimension_scores": _dimension_scores(_value(item, "dimension_scores", {})),
+        "low_score_reasons": _string_list(_value(item, "low_score_reasons")),
         "reason": str(_value(item, "reason") or ""),
         "source": source,
         "record": scenario,
@@ -84,6 +102,11 @@ def _normalize_use_case_match(
             str(key): _string_list(value)
             for key, value in (_value(item, "matched_fields", {}) or {}).items()
         },
+        "base_score": float(_value(item, "base_score", 0.0) or 0.0),
+        "consistency_bonus": float(_value(item, "consistency_bonus", 0.0) or 0.0),
+        "evaluation": str(_value(item, "evaluation") or "未评价"),
+        "dimension_scores": _dimension_scores(_value(item, "dimension_scores", {})),
+        "low_score_reasons": _string_list(_value(item, "low_score_reasons")),
         "source": source,
         "record": use_case,
     }
@@ -102,9 +125,20 @@ def _merge_match_rows(rows: list[dict[str, Any]], row: dict[str, Any]) -> None:
         for field in ("matched_dimensions", "gaps", "conflicts"):
             if field in row:
                 existing[field] = _merge_strings(existing.get(field, []), row.get(field))
+        existing["low_score_reasons"] = _merge_strings(
+            existing.get("low_score_reasons", []), row.get("low_score_reasons")
+        )
         if row.get("score", 0.0) > existing.get("score", 0.0):
             existing["score"] = row["score"]
             existing["record"] = row.get("record", existing.get("record", {}))
+            for field in (
+                "base_score",
+                "consistency_bonus",
+                "evaluation",
+                "dimension_scores",
+            ):
+                if field in row:
+                    existing[field] = row[field]
         existing["source"] = _merge_strings(
             _string_list(existing.get("source")), row.get("source")
         )
@@ -163,6 +197,246 @@ def _match_rows(result: AgentResult, library: ScenarioLibrary | None) -> tuple[l
     scenario_rows.sort(key=lambda item: (-float(item.get("score", 0.0)), item["name"]))
     use_case_rows.sort(key=lambda item: (-float(item.get("score", 0.0)), item["name"]))
     return scenario_rows, use_case_rows
+
+
+def _matching_summary(result: AgentResult) -> dict[str, Any]:
+    for call in result.tool_calls:
+        payload = call.result if isinstance(call.result, dict) else {}
+        if call.name == "match_ir_requirement" and isinstance(payload.get("match"), dict):
+            match = payload["match"]
+            return {
+                "tool": call.name,
+                "confidence": float(match.get("confidence", 0.0) or 0.0),
+                "confidence_label": str(match.get("confidence_label") or "未评价"),
+                "confidence_reasons": _string_list(match.get("confidence_reasons")),
+                "score_margin": float(match.get("score_margin", 0.0) or 0.0),
+                "ambiguous": bool(match.get("ambiguous", False)),
+                "decision": str(match.get("decision") or ""),
+            }
+        if call.name in {"match_scenario", "match_use_case"}:
+            return {
+                "tool": call.name,
+                "confidence": float(payload.get("confidence", 0.0) or 0.0),
+                "confidence_label": "可复用候选"
+                if payload.get("decision") == "reuse_existing"
+                else "低分/建议新增",
+                "confidence_reasons": _string_list(payload.get("rationale")),
+                "score_margin": 0.0,
+                "ambiguous": False,
+                "decision": str(payload.get("decision") or ""),
+            }
+        if call.name == "evaluate_scenario_fit" and isinstance(payload.get("evaluation"), dict):
+            evaluation = payload["evaluation"]
+            return {
+                "tool": call.name,
+                "confidence": float(evaluation.get("score", 0.0) or 0.0),
+                "confidence_label": str(evaluation.get("confidence_label") or evaluation.get("evaluation") or "未评价"),
+                "confidence_reasons": _string_list(
+                    evaluation.get("confidence_reasons")
+                    or evaluation.get("low_score_reasons")
+                ),
+                "score_margin": 0.0,
+                "ambiguous": False,
+                "decision": "evaluate_scenario_fit",
+            }
+    return {
+        "tool": None,
+        "confidence": 0.0,
+        "confidence_label": "未调用匹配工具",
+        "confidence_reasons": ["本轮没有匹配工具事实。"],
+        "score_margin": 0.0,
+        "ambiguous": False,
+        "decision": "needs_clarification",
+    }
+
+
+def _scenario_fit_evaluations(result: AgentResult) -> list[dict[str, Any]]:
+    evaluations: list[dict[str, Any]] = []
+    for call in result.tool_calls:
+        if call.name != "evaluate_scenario_fit":
+            continue
+        payload = call.result if isinstance(call.result, dict) else {}
+        evaluation = payload.get("evaluation")
+        if isinstance(evaluation, dict):
+            evaluations.append(dict(evaluation))
+    return evaluations
+
+
+def _ir_payload(result: AgentResult, evaluations: list[dict[str, Any]]) -> dict[str, Any]:
+    for evaluation in evaluations:
+        ir = evaluation.get("ir")
+        if isinstance(ir, dict):
+            return ir
+    for call in result.tool_calls:
+        if call.name != "match_ir_requirement":
+            continue
+        payload = call.result if isinstance(call.result, dict) else {}
+        match = payload.get("match")
+        if isinstance(match, dict) and isinstance(match.get("ir"), dict):
+            return dict(match["ir"])
+    return {}
+
+
+def _display_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
+_SC_FIELD_COMPARISON = (
+    ("description", "description", "description", "目标/行为", "SC description 必填"),
+    ("category", None, "category", "目标/行为", "SC category 必须符合 Spec"),
+    ("business_goal", "what", "business_goal", "目标/行为", "SC business_goal 必填"),
+    ("actor", "who", "actor", "Actor", "SC actor 必填"),
+    ("actions", "how", "actions", "目标/行为", "SC actions 必填"),
+    ("influence_factors", "where", "influence_factors", "影响因素", "至少一个影响因素且有 selected_values"),
+    ("lifecycle", "when", "lifecycle", "上下文", "SC lifecycle 必填"),
+    ("constraints", "constraints", "constraints", "约束", "SC constraints 必填"),
+    ("owner", "owner", "owner", "Actor", "SC owner 必填"),
+)
+
+
+def _field_comparison_rows(
+    ir: dict[str, Any],
+    scenario_rows: list[dict[str, Any]],
+    evaluations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    sources: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    for item in scenario_rows:
+        sources.append((item.get("record") or {}, "场景库候选", item))
+    for evaluation in evaluations:
+        scenario = evaluation.get("scenario")
+        if isinstance(scenario, dict):
+            match_like = {
+                "id": evaluation.get("scenario_id"),
+                "name": scenario.get("name"),
+                "score": evaluation.get("score", 0.0),
+                "evaluation": evaluation.get("evaluation", "未评价"),
+                "dimension_scores": evaluation.get("dimension_scores", {}),
+                "matched_fields": {},
+                "low_score_reasons": evaluation.get("low_score_reasons", []),
+                "gaps": evaluation.get("gaps", []),
+                "conflicts": evaluation.get("conflicts", []),
+                "source": "evaluate_scenario_fit",
+            }
+            sources.append((scenario, "指定 SC 评估", match_like))
+
+    ir_code = str(ir.get("code") or ir.get("id") or "")
+    for scenario, source_type, match in sources:
+        dimension_scores = match.get("dimension_scores") or {}
+        matched_fields = match.get("matched_fields") or {}
+        for field_name, ir_field, sc_field, dimension, spec_rule in _SC_FIELD_COMPARISON:
+            ai_value = scenario.get(sc_field)
+            if ir_field is None:
+                basis = "当前场景记录与 active_business_spec 校验"
+            else:
+                basis = f"IR {ir_field} → SC {sc_field}"
+            evidence = _string_list(matched_fields.get(dimension))
+            detail = dimension_scores.get(dimension) or {}
+            score = float(detail.get("score", 0.0) or 0.0)
+            if not ai_value:
+                ai_consistency_hint = "缺失"
+            elif score >= 0.70:
+                ai_consistency_hint = "初步一致"
+            elif score >= 0.45:
+                ai_consistency_hint = "部分一致"
+            elif dimension in dimension_scores:
+                ai_consistency_hint = "不一致/需核对"
+            else:
+                ai_consistency_hint = "待人工"
+            rows.append(
+                {
+                    "ir_code": ir_code,
+                    "sc_id": str(match.get("id") or scenario.get("id") or ""),
+                    "sc_name": str(scenario.get("name") or ""),
+                    "source_type": source_type,
+                    "field_name": field_name,
+                    "ai_value": _display_value(ai_value),
+                    "analysis_basis": basis,
+                    "skill": "IR→SC 场景匹配",
+                    "spec_rule": spec_rule,
+                    "method": "字段覆盖 + 同义词扩展 + 加权评分 + 冲突检查",
+                    "human_value": "",
+                    "consistency": "待人工确认",
+                    "ai_consistency_hint": ai_consistency_hint,
+                    "consistency_reason": (
+                        f"人工分析字段值为空；AI预判：{ai_consistency_hint}。"
+                        f"{str(detail.get('reason') or '') or '请人工填写分析值后复核。'}"
+                    ),
+                    "dimension_score": f"{score:.2f}",
+                    "evidence": "、".join(evidence),
+                    "low_score_reason": "；".join(_string_list(match.get("low_score_reasons"))),
+                }
+            )
+    return rows
+
+
+def _match_summary_rows(
+    scenario_matches: list[dict[str, Any]],
+    use_case_matches: list[dict[str, Any]],
+    matching: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record_type, matches in (("SC", scenario_matches), ("UC", use_case_matches)):
+        for rank, item in enumerate(matches, start=1):
+            dimension_scores = item.get("dimension_scores") or {}
+            row: dict[str, Any] = {
+                "record_type": record_type,
+                "record_id": item.get("id", ""),
+                "record_name": item.get("name", ""),
+                "parent_scenario_id": item.get("parent_scenario_id", ""),
+                "rank": rank,
+                "total_score": f"{float(item.get('score', 0.0) or 0.0):.4f}",
+                "base_score": f"{float(item.get('base_score', 0.0) or 0.0):.4f}",
+                "consistency_bonus": f"{float(item.get('consistency_bonus', 0.0) or 0.0):.4f}",
+                "evaluation": item.get("evaluation", "未评价"),
+                "confidence_label": matching.get("confidence_label", "未评价"),
+                "low_score_reasons": "；".join(_string_list(item.get("low_score_reasons"))),
+                "gaps": "；".join(_string_list(item.get("gaps"))),
+                "conflicts": "；".join(_string_list(item.get("conflicts"))),
+                "source": "、".join(_string_list(item.get("source"))),
+            }
+            for dimension, detail in dimension_scores.items():
+                row[f"{dimension}_score"] = f"{float(detail.get('score', 0.0) or 0.0):.4f}"
+                row[f"{dimension}_weighted"] = f"{float(detail.get('weighted_score', 0.0) or 0.0):.4f}"
+                row[f"{dimension}_level"] = str(detail.get("level") or "")
+                row[f"{dimension}_evidence"] = "、".join(
+                    _string_list(detail.get("evidence"))
+                )
+                row[f"{dimension}_reason"] = str(detail.get("reason") or "")
+            rows.append(row)
+    return rows
+
+
+def _scenario_fit_csv_rows(evaluations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for evaluation in evaluations:
+        scenario = evaluation.get("scenario") or {}
+        row: dict[str, Any] = {
+            "scenario_id": evaluation.get("scenario_id") or scenario.get("id", ""),
+            "scenario_name": scenario.get("name", ""),
+            "score": f"{float(evaluation.get('score', 0.0) or 0.0):.4f}",
+            "evaluation": evaluation.get("evaluation", "未评价"),
+            "confidence_label": evaluation.get("confidence_label", "未评价"),
+            "low_score_reasons": "；".join(_string_list(evaluation.get("low_score_reasons"))),
+            "gaps": "；".join(_string_list(evaluation.get("gaps"))),
+            "conflicts": "；".join(_string_list(evaluation.get("conflicts"))),
+        }
+        for dimension, detail in (evaluation.get("dimension_scores") or {}).items():
+            if not isinstance(detail, dict):
+                continue
+            row[f"{dimension}_score"] = f"{float(detail.get('score', 0.0) or 0.0):.4f}"
+            row[f"{dimension}_weighted"] = f"{float(detail.get('weighted_score', 0.0) or 0.0):.4f}"
+            row[f"{dimension}_level"] = str(detail.get("level") or "")
+            row[f"{dimension}_evidence"] = "、".join(
+                _string_list(detail.get("evidence"))
+            )
+            row[f"{dimension}_reason"] = str(detail.get("reason") or "")
+        rows.append(row)
+    return rows
 
 
 def _write_rows(result: AgentResult) -> dict[str, list[dict[str, Any]]]:
@@ -225,6 +499,9 @@ def build_analysis_report(result: AgentResult, library: ScenarioLibrary | None =
     """Build a stable, explainable SC/UC report from tool facts and the final resolution."""
 
     scenario_matches, use_case_matches = _match_rows(result, library)
+    evaluations = _scenario_fit_evaluations(result)
+    matching = _matching_summary(result)
+    ir = _ir_payload(result, evaluations)
     resolution = result.resolution.model_dump(mode="json") if result.resolution else None
     writes = _write_rows(result)
     selected_scenario_ids = list(resolution.get("selected_scenario_ids", [])) if resolution else []
@@ -273,6 +550,9 @@ def build_analysis_report(result: AgentResult, library: ScenarioLibrary | None =
     }
     return {
         "resolution": resolution,
+        "matching": matching,
+        "field_comparison": _field_comparison_rows(ir, scenario_matches, evaluations),
+        "evaluations": {"scenario_fit": evaluations},
         "scenarios": {
             "matches": scenario_matches,
             "selected": selected_scenarios,
@@ -309,7 +589,29 @@ def _evidence_text(fields: Any) -> str:
     )
 
 
-def render_markdown_report(report: dict[str, Any]) -> str:
+def _dimension_lines(item: dict[str, Any], *, indent: str = "  ") -> list[str]:
+    lines: list[str] = []
+    dimension_scores = item.get("dimension_scores") or {}
+    for label, detail in dimension_scores.items():
+        if not isinstance(detail, dict):
+            continue
+        evidence = "、".join(_string_list(detail.get("evidence"))) or "无"
+        lines.append(
+            f"{indent}- {label}：{float(detail.get('score', 0.0) or 0.0):.2f} "
+            f"× {float(detail.get('weight', 0.0) or 0.0):.2f} = "
+            f"{float(detail.get('weighted_score', 0.0) or 0.0):.2f} "
+            f"（{detail.get('level', '未评价')}；证据：{evidence}）"
+        )
+        if detail.get("reason"):
+            lines.append(f"{indent}  说明：{detail['reason']}")
+    return lines
+
+
+def _markdown_cell(value: Any) -> str:
+    return str(value or "").replace("|", "\\|").replace("\n", " ")
+
+
+def _render_markdown_report_legacy(report: dict[str, Any]) -> str:
     resolution = report.get("resolution") or {}
     lines = [
         "# IR / SC / UC 分析报告",
@@ -369,6 +671,158 @@ def render_markdown_report(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_markdown_report(report: dict[str, Any]) -> str:
+    resolution = report.get("resolution") or {}
+    matching = report.get("matching") or {}
+    lines = [
+        "# IR / SC / UC 分析报告",
+        "",
+        f"- 状态：{resolution.get('status', '未结构化')}",
+        f"- 决策：{resolution.get('decision', '-')}",
+        f"- 需求理解：{resolution.get('request_summary', '-')}",
+        f"- 匹配工具：{matching.get('tool') or '未调用'}",
+        f"- 置信度信号：{float(matching.get('confidence', 0.0) or 0.0):.2f}",
+        f"- 置信度评价：{matching.get('confidence_label', '未评价')}",
+        "",
+        "## 置信度原因",
+        "",
+    ]
+    confidence_reasons = _string_list(matching.get("confidence_reasons"))
+    lines.extend(f"- {reason}" for reason in confidence_reasons or ["无额外说明。"])
+    if matching.get("ambiguous"):
+        lines.append(
+            f"- 候选分差：{float(matching.get('score_margin', 0.0) or 0.0):.2f}，存在歧义。"
+        )
+
+    lines.extend(["", "## 场景 SC", ""])
+    scenario_matches = report.get("scenarios", {}).get("matches", [])
+    if scenario_matches:
+        for item in scenario_matches:
+            lines.append(
+                f"- **{item['id']} {item['name']}**（分数 {float(item.get('score', 0.0)):.2f}）"
+            )
+            lines.append(
+                f"  - 评分构成：基础分 {float(item.get('base_score', 0.0) or 0.0):.2f} "
+                f"+ 一致性加分 {float(item.get('consistency_bonus', 0.0) or 0.0):.2f}"
+            )
+            lines.append(f"  - 评价：{item.get('evaluation', '未评价')}")
+            lines.extend(_dimension_lines(item))
+            lines.append(f"  - 命中部分：{_evidence_text(item.get('matched_fields'))}")
+            if item.get("low_score_reasons"):
+                lines.append(f"  - 低分原因：{'；'.join(item['low_score_reasons'])}")
+            if item.get("gaps"):
+                lines.append(f"  - 未覆盖：{'；'.join(item['gaps'])}")
+            if item.get("conflicts"):
+                lines.append(f"  - 冲突：{'；'.join(item['conflicts'])}")
+    else:
+        lines.append("未找到结构化 SC 候选；如确认无匹配，可根据草稿补齐后新建 SC。")
+
+    lines.extend(["", "## 用例 UC", ""])
+    use_case_matches = report.get("use_cases", {}).get("matches", [])
+    if use_case_matches:
+        for item in use_case_matches:
+            parent = item.get("parent_scenario_id") or "父 SC 未解析"
+            lines.append(
+                f"- **{item['id']} {item['name']}**（父 SC：{parent}，分数 {float(item.get('score', 0.0)):.2f}）"
+            )
+            lines.append(
+                f"  - 评分构成：基础分 {float(item.get('base_score', 0.0) or 0.0):.2f} "
+                f"+ 一致性加分 {float(item.get('consistency_bonus', 0.0) or 0.0):.2f}"
+            )
+            lines.append(f"  - 评价：{item.get('evaluation', '未评价')}")
+            lines.extend(_dimension_lines(item))
+            lines.append(f"  - 命中部分：{_evidence_text(item.get('matched_fields'))}")
+            if item.get("low_score_reasons"):
+                lines.append(f"  - 低分原因：{'；'.join(item['low_score_reasons'])}")
+    else:
+        lines.append("未找到结构化 UC 候选；如 SC 可复用但行为链不同，可在该 SC 下新增 UC。")
+
+    lines.extend(["", "## SC → UC 关系", ""])
+    relationships = report.get("use_cases", {}).get("by_scenario", [])
+    if relationships:
+        for item in relationships:
+            ids = "、".join(item.get("use_case_ids", [])) or "暂无 UC"
+            lines.append(f"- {item['scenario_id']} {item['scenario_name']}：{ids}")
+    else:
+        lines.append("本轮没有可读取的父子关系。")
+
+    lines.extend(["", "## 指定 SC 符合度评估", ""])
+    evaluations = report.get("evaluations", {}).get("scenario_fit", [])
+    if evaluations:
+        for evaluation in evaluations:
+            scenario = evaluation.get("scenario") or {}
+            lines.append(
+                f"- **{evaluation.get('scenario_id', scenario.get('id', '-'))} "
+                f"{scenario.get('name', '')}**：{float(evaluation.get('score', 0.0) or 0.0):.2f} "
+                f"（{evaluation.get('evaluation', '未评价')}）"
+            )
+            lines.extend(_dimension_lines(evaluation))
+            reasons = _string_list(evaluation.get("low_score_reasons"))
+            if reasons:
+                lines.append(f"  - 原因：{'；'.join(reasons)}")
+    else:
+        lines.append("本轮没有调用指定 SC 符合度评估。")
+
+    lines.extend(["", "## 人工复核字段表", ""])
+    field_rows = report.get("field_comparison", [])
+    if field_rows:
+        lines.extend(
+            [
+                "| 字段名 | AI/候选字段值 | 分析依据 | Spec/方法 | 人工分析字段值 | 一致性对比 | AI预判 | 说明 |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+        )
+        for row in field_rows:
+            lines.append(
+                "| "
+                + " | ".join(
+                    _markdown_cell(row.get(key))
+                    for key in (
+                        "field_name",
+                        "ai_value",
+                        "analysis_basis",
+                        "spec_rule",
+                        "human_value",
+                        "consistency",
+                        "ai_consistency_hint",
+                        "consistency_reason",
+                    )
+                )
+                + " |"
+            )
+    else:
+        lines.append("本轮没有可生成的字段复核行。")
+
+    lines.extend(["", "## 库写入", ""])
+    writes = report.get("writes", [])
+    if writes:
+        for item in writes:
+            lines.append(
+                f"- {item.get('action')} {item.get('id')}（工具：{item.get('tool')}，已审批：{item.get('approved')}）"
+            )
+        lines.append("原场景库已更新；结果目录中的 SC/UC 文件是本轮快照。")
+    else:
+        lines.append("本轮没有执行库写入。")
+    return "\n".join(lines) + "\n"
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]], base_fields: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    extra_fields = sorted(
+        {
+            str(key)
+            for row in rows
+            for key in row
+            if str(key) not in base_fields
+        }
+    )
+    fieldnames = [*base_fields, *extra_fields]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def save_run_report(
     result: AgentResult,
     output_dir: str | Path,
@@ -409,6 +863,87 @@ def save_run_report(
     _write_json(run_root / "use_cases" / "selected.json", report["use_cases"]["selected"])
     _write_json(run_root / "use_cases" / "created.json", report["use_cases"]["created"])
     _write_json(run_root / "use_cases" / "updated.json", report["use_cases"]["updated"])
+    summary_rows = _match_summary_rows(
+        report["scenarios"]["matches"],
+        report["use_cases"]["matches"],
+        report.get("matching", {}),
+    )
+    _write_csv(
+        run_root / "evaluation" / "match_summary.csv",
+        summary_rows,
+        [
+            "record_type",
+            "record_id",
+            "record_name",
+            "parent_scenario_id",
+            "rank",
+            "total_score",
+            "base_score",
+            "consistency_bonus",
+            "evaluation",
+            "confidence_label",
+            "low_score_reasons",
+            "gaps",
+            "conflicts",
+            "source",
+        ],
+    )
+    _write_csv(
+        run_root / "evaluation" / "field_comparison.csv",
+        report.get("field_comparison", []),
+        [
+            "ir_code",
+            "sc_id",
+            "sc_name",
+            "source_type",
+            "field_name",
+            "ai_value",
+            "analysis_basis",
+            "skill",
+            "spec_rule",
+            "method",
+            "human_value",
+            "consistency",
+            "ai_consistency_hint",
+            "consistency_reason",
+            "dimension_score",
+            "evidence",
+            "low_score_reason",
+        ],
+    )
+    _write_csv(
+        run_root / "evaluation" / "human_review_template.csv",
+        report.get("field_comparison", []),
+        [
+            "ir_code",
+            "sc_id",
+            "sc_name",
+            "field_name",
+            "ai_value",
+            "analysis_basis",
+            "skill",
+            "spec_rule",
+            "method",
+            "human_value",
+            "consistency",
+            "ai_consistency_hint",
+            "consistency_reason",
+        ],
+    )
+    _write_csv(
+        run_root / "evaluation" / "scenario_fit.csv",
+        _scenario_fit_csv_rows(report.get("evaluations", {}).get("scenario_fit", [])),
+        [
+            "scenario_id",
+            "scenario_name",
+            "score",
+            "evaluation",
+            "confidence_label",
+            "low_score_reasons",
+            "gaps",
+            "conflicts",
+        ],
+    )
     for relationship in report["use_cases"]["by_scenario"]:
         _write_json(
             run_root
@@ -423,6 +958,13 @@ def save_run_report(
         "report_markdown": str((run_root / "report.md").resolve()),
         "scenarios_dir": str((run_root / "scenarios").resolve()),
         "use_cases_dir": str((run_root / "use_cases").resolve()),
+        "evaluation_dir": str((run_root / "evaluation").resolve()),
+        "match_summary_csv": str((run_root / "evaluation" / "match_summary.csv").resolve()),
+        "field_comparison_csv": str((run_root / "evaluation" / "field_comparison.csv").resolve()),
+        "human_review_template_csv": str(
+            (run_root / "evaluation" / "human_review_template.csv").resolve()
+        ),
+        "scenario_fit_csv": str((run_root / "evaluation" / "scenario_fit.csv").resolve()),
     }
     _write_json(run_root / "manifest.json", manifest)
     return (run_root / "result.json").resolve()

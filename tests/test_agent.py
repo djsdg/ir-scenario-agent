@@ -277,8 +277,11 @@ class AgentTests(unittest.TestCase):
         result = agent.run("找一个企业知识库多轮问答场景")
 
         self.assertIsNotNone(result.resolution)
-        self.assertEqual(result.resolution.status, "matched")
-        self.assertEqual(result.resolution.selected_scenario_ids, ["scn_enterprise_knowledge_qa"])
+        self.assertEqual(result.resolution.status, "needs_clarification")
+        self.assertEqual(result.resolution.selected_scenario_ids, [])
+        self.assertTrue(
+            any("匹配工具" in item for item in result.resolution.gaps)
+        )
         self.assertEqual(result.usage["total_tokens"], 30)
         self.assertEqual(transport.last_request["text"]["format"]["type"], "json_schema")
         self.assertNotIn("$defs", transport.last_request["text"]["format"]["schema"])
@@ -307,7 +310,11 @@ class AgentTests(unittest.TestCase):
             )
         ]
 
-        guarded = _guard_resolution_facts(resolution, records)
+        guarded = _guard_resolution_facts(
+            resolution,
+            records,
+            require_matching_tool=True,
+        )
 
         self.assertIsNotNone(guarded)
         self.assertEqual(guarded.decision, "needs_clarification")
@@ -315,14 +322,15 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(guarded.use_case_ids, [])
         self.assertTrue(any("选中 SC 编号" in item for item in guarded.gaps))
 
-    def test_structured_resolution_is_checked_against_library_without_tool_calls(self) -> None:
+    def test_structured_resolution_is_rejected_without_matching_tool_calls(self) -> None:
+        real_scenario_id = self.library.list_scenarios()[0].id
         resolution = ScenarioResolution(
             status="matched",
             decision="reuse_scenario_and_uc",
             ir_id=None,
             request_summary="测试",
             candidates=[],
-            selected_scenario_ids=["SCN-FAKE"],
+            selected_scenario_ids=[real_scenario_id],
             use_case_ids=[],
             created_scenario_id=None,
             created_use_case_ids=[],
@@ -337,11 +345,57 @@ class AgentTests(unittest.TestCase):
             [],
             known_scenario_ids={item.id for item in self.library.list_scenarios()},
             known_use_case_ids={item.id for item in self.library.list_use_cases()},
+            require_matching_tool=True,
         )
 
         self.assertIsNotNone(guarded)
         self.assertEqual(guarded.decision, "needs_clarification")
         self.assertEqual(guarded.selected_scenario_ids, [])
+        self.assertTrue(any("不能作为事实" in item for item in guarded.gaps))
+
+    def test_structured_resolution_accepts_ids_from_matching_tool(self) -> None:
+        scenario = self.library.list_scenarios()[0]
+        use_case = self.library.get_use_case(scenario.use_case_ids[0])
+        resolution = ScenarioResolution(
+            status="matched",
+            decision="reuse_scenario_and_uc",
+            ir_id=None,
+            request_summary="测试",
+            candidates=[],
+            selected_scenario_ids=[scenario.id],
+            use_case_ids=[use_case.id],
+            created_scenario_id=None,
+            created_use_case_ids=[],
+            confidence=0.9,
+            missing_required_fields=[],
+            gaps=[],
+            next_steps=[],
+        )
+        records = [
+            ToolCallRecord(
+                name="match_ir_requirement",
+                arguments={},
+                result={
+                    "ok": True,
+                    "match": {
+                        "scenario_matches": [{"scenario": {"id": scenario.id}}],
+                        "use_case_matches": [{"use_case": {"id": use_case.id}}],
+                    },
+                },
+            )
+        ]
+
+        guarded = _guard_resolution_facts(
+            resolution,
+            records,
+            known_scenario_ids={item.id for item in self.library.list_scenarios()},
+            known_use_case_ids={item.id for item in self.library.list_use_cases()},
+            require_matching_tool=True,
+        )
+
+        self.assertEqual(guarded.decision, "reuse_scenario_and_uc")
+        self.assertEqual(guarded.selected_scenario_ids, [scenario.id])
+        self.assertEqual(guarded.use_case_ids, [use_case.id])
 
     def test_context_compaction_is_used_before_request(self) -> None:
         transport = CompactingTransport()

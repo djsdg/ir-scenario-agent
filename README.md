@@ -11,6 +11,7 @@
 - 默认使用 OpenAI Responses API；也支持 `chat_completions` 模式接入 DeepSeek 等 OpenAI 兼容服务。
 - 使用严格 JSON Schema 的 function tools：
   - `match_ir_requirement`：按 5W2H/DFX、Actor、生命周期、影响因素、约束和 UC 行为链匹配。
+  - `evaluate_scenario_fit`：对用户指定的单个 SC 做只读符合度评估，返回总分、各维度分数、证据、低分原因、缺口和冲突。
   - `match_scenario`：对单独输入的 SC 描述匹配场景库，返回候选、置信度和复用/新建建议。
   - `match_use_case`：对单独输入的 UC 行为链匹配 UC 库，可限定唯一父 SC。
   - `draft_scenario_from_ir`：按可加载业务 Spec 将 IR 映射成只读 SC 草稿并返回待补字段。
@@ -33,6 +34,7 @@
 - 使用 `config/ir_sc_uc_spec.json` 约束 IR→SC→UC 映射、场景类别/状态、六类影响因素维度和质量输出；不把 IR 直接当 SC。
 - Spec 的 `matching` 段可配置复用阈值、候选歧义分差和领域同义词/冲突词；更换业务领域时优先改配置，不必修改匹配代码。
 - 匹配默认使用关键词证据 + TF-IDF 的混合检索，并支持 Spec 同义词；设置 `IR_AGENT_EMBEDDING_MODEL` 后会叠加 OpenAI 兼容 Embedding，服务不可用时自动回退。
+- 匹配结果不是只给一个不可解释的置信度：SC 会展示“目标/行为、Actor、上下文、影响因素、约束”各维度的分数、权重、加权分、证据、评价和低分原因；UC 会展示“行为链、名称”维度。分数是确定性的匹配信号，不是概率。
 - 场景硬性校验 `description`、`category`、`business_goal`、`actor`、`actions`、`lifecycle`、`constraints`、`influence_factors`、`owner`；影响因素至少有一个选中值。
 - UC 硬性校验前置条件、触发事件、成功/最小保证和主成功场景，拒绝写入空壳 UC。
 - 支持项目级 Skill：从 `skills/**/SKILL.md` 自动发现、按需求选择，也可以由 agent 搜索/加载。
@@ -43,8 +45,9 @@
 - 本地工具、审批、审计和场景库逻辑与模型供应商解耦；Chat Completions 模式下远程 MCP 不启用，插件和本地 function tools 仍可用。
 - 提供可选 Textual TUI：多行粘贴 IR/SC/UC、后台执行模型请求、显示匹配结果/工具调用，并支持写入与 MCP 授权弹窗。
 - TUI 的 IR 文档和场景库读取在后台任务执行；切换场景库时会隔离旧会话上下文。对话、匹配详情、工具日志、路径和结果摘要均为只读可选中文本区，支持鼠标拖选、`Ctrl+C` 复制和 `Ctrl+A` 全选。每轮结果会保存为一个独立目录，包含总结果、Markdown 报告，以及分开的 `scenarios/` 和 `use_cases/` 子目录；其中 `use_cases/by_scenario/` 按父 SC 保存多个 UC 的关系快照。
+- TUI 候选对比表增加了“评价”和“低分原因”，候选日志会展开完整评分构成；选中 SC 后可点击“评估当前 SC”执行只读指定场景测试，不会写库。
 - Responses 模式使用严格 JSON Schema；Chat Completions 模式使用 JSON mode 并由 Pydantic 做最终校验，方便后续 Web/API 消费；CLI 默认把它渲染成人类可读摘要。
-- 最终结构化结果会再次对照当前场景库和工具返回的真实 ID；如果模型输出了不存在或未由写入工具产生的 SC/UC 编号，会自动降级为待澄清，不把模型文本当成事实。
+- 最终结构化结果会执行工具来源校验：候选/选中的 SC、UC 必须来自本轮成功的 `match_ir_requirement`、`match_scenario`、`match_use_case` 或 `evaluate_scenario_fit` 返回；仅仅因为编号存在于库中，不能证明本轮匹配成立。若模型没有调用匹配工具、输出了未由匹配工具返回的编号，或新建 ID 未由写入工具产生，会自动降级为待澄清，不把模型文本当成事实。
 - 场景库和记忆写入工具默认需要应用层人工批准；批准、拒绝、耗时和结果会写入 JSONL 审计日志。
 - API 临时失败支持指数退避重试；会话超过本地阈值时优先使用 `/responses/compact`，不可用时使用有界本地回退。
 - 本地 JSON 场景库，开箱即用；后续可以替换成 PostgreSQL、向量数据库或企业知识库。
@@ -60,6 +63,8 @@
 - UC 命中了哪些字段：前置条件、触发事件、主成功场景、成功保证、DFX 等；
 - 每个 UC 的父 SC，以及一个 SC 下的多个 UC；
 - 缺口和冲突，而不是只显示一个分数。
+- 总分构成：基础分、维度加权分和一致性加分；每个维度附带命中证据、文字评价和低分原因。
+- 指定 SC 的符合度测试结果，以及“信息不足/需人工确认/候选可复用/强匹配/建议新增”等置信度评价。
 
 一次运行的输出目录结构类似：
 
@@ -69,6 +74,11 @@ data/outputs/<session_id>/<timestamp>_<id>/
 ├── report.json
 ├── report.md
 ├── manifest.json
+├── evaluation/
+│   ├── match_summary.csv              # SC/UC 总分、维度分数、低分原因
+│   ├── field_comparison.csv           # AI 字段、依据、Spec/方法、人工值、一致性
+│   ├── human_review_template.csv      # 可交给人工补填的复核模板
+│   └── scenario_fit.csv               # 指定 SC 符合度测试结果
 ├── scenarios/
 │   ├── matches.json
 │   ├── selected.json

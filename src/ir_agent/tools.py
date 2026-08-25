@@ -50,6 +50,11 @@ class MatchIRArgs(StrictArgs):
     min_score: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class EvaluateScenarioFitArgs(StrictArgs):
+    ir: IRRequirementInput
+    scenario_id: str = Field(min_length=1, max_length=120)
+
+
 class DraftScenarioArgs(StrictArgs):
     ir: IRRequirementInput
 
@@ -168,6 +173,19 @@ def _match_ir_parameters() -> dict[str, Any]:
             "min_score": {"type": "number", "minimum": 0, "maximum": 1},
         },
         "required": ["ir", "top_k", "min_score"],
+    }
+
+
+def _evaluate_scenario_fit_parameters() -> dict[str, Any]:
+    properties = {
+        "ir": _ir_schema(),
+        "scenario_id": {"type": "string", "minLength": 1, "maxLength": 120},
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
     }
 
 
@@ -521,6 +539,21 @@ class ToolRegistry:
                     "match": self.library.match_ir(
                         args.ir, top_k=args.top_k, min_score=args.min_score
                     ).model_dump(mode="json")
+                },
+            ),
+            "evaluate_scenario_fit": ToolSpec(
+                name="evaluate_scenario_fit",
+                description=(
+                    "Evaluate one explicitly selected SC against a normalized IR. "
+                    "Read-only; returns total score, every dimension score, low-score reasons, "
+                    "gaps, conflicts, and child UC coverage for testing or human review."
+                ),
+                parameters=_evaluate_scenario_fit_parameters(),
+                input_model=EvaluateScenarioFitArgs,
+                handler=lambda args: {
+                    "evaluation": self.library.evaluate_scenario_fit(
+                        args.ir, args.scenario_id
+                    )
                 },
             ),
             "draft_scenario_from_ir": ToolSpec(
