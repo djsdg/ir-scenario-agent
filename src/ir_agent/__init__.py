@@ -28,7 +28,13 @@ from .library import ScenarioLibrary, open_scenario_library
 from .mcp import MCPConfig, MCPServerConfig
 from .memory import MemoryStore
 from .plugins import PluginContext, PluginManager
-from .reporting import build_analysis_report, save_run_report
+from .reporting import (
+    apply_human_review,
+    build_analysis_report,
+    render_human_review_text,
+    save_reviewed_report,
+    save_run_report,
+)
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
 from .sqlite_library import SQLiteScenarioLibrary
@@ -53,6 +59,9 @@ __all__ = [
     "PluginContext",
     "PluginManager",
     "build_analysis_report",
+    "apply_human_review",
+    "render_human_review_text",
+    "save_reviewed_report",
     "save_run_report",
     "Scenario",
     "ScenarioLibrary",

@@ -27,7 +27,7 @@ from .mcp import MCPConfig
 from .memory import MemoryStore
 from .plugins import PluginContext, PluginLoadReport, PluginManager
 from .retrieval import OpenAIEmbeddingProvider
-from .reporting import build_analysis_report, save_run_report
+from .reporting import build_analysis_report, render_human_review_text, save_run_report
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
 from .tools import ToolRegistry
@@ -355,6 +355,11 @@ if _TEXTUAL_IMPORT_ERROR is None:
             padding: 0 1;
             scrollbar-size: 1 1;
         }
+        #human-review {
+            height: 1fr;
+            padding: 0 1;
+            scrollbar-size: 1 1;
+        }
         #prompt {
             height: 1fr;
             border: round $accent;
@@ -546,6 +551,11 @@ if _TEXTUAL_IMPORT_ERROR is None:
                                     yield Button("检查库质量", id="validate-library")
                                     yield Button("清空选择", id="clear-selection")
                                 yield _CopyableTextArea(id="candidates")
+                            with TabPane("人工复核", id="review-tab"):
+                                yield _CopyableTextArea(
+                                    "本轮结果后显示候选总览和字段复核提示。完整可编辑内容请打开复核 CSV。",
+                                    id="human-review",
+                                )
                             with TabPane("工具日志", id="tools-tab"):
                                 yield _CopyableTextArea(id="tools")
                 with Vertical(id="side"):
@@ -556,6 +566,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     with Horizontal(id="result-actions"):
                         yield Button("打开输出目录", id="open-output", disabled=True)
                         yield Button("打开结果文件", id="open-result", disabled=True)
+                        yield Button("打开复核表", id="open-review", disabled=True)
             yield Footer()
 
         def on_mount(self) -> None:
@@ -675,6 +686,8 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 )
             elif button_id == "open-result":
                 self._open_result_path(self._last_output_path)
+            elif button_id == "open-review":
+                self._open_review_csv()
             elif button_id == "quit":
                 self.exit()
 
@@ -691,6 +704,10 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self._last_output_path = None
             self.query_one("#open-output", Button).disabled = True
             self.query_one("#open-result", Button).disabled = True
+            self.query_one("#open-review", Button).disabled = True
+            self.query_one("#human-review", _CopyableTextArea).update(
+                "本轮结果后显示候选总览和字段复核提示。完整可编辑内容请打开复核 CSV。"
+            )
             self._clear_selection()
 
         def on_data_table_row_selected(self, event: Any) -> None:
@@ -1082,6 +1099,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             self._last_output_path = output_path
             self.query_one("#open-output", Button).disabled = output_path is None
             self.query_one("#open-result", Button).disabled = output_path is None
+            self.query_one("#open-review", Button).disabled = output_path is None
             self._write_result(result, output_path)
             self._set_status("就绪")
 
@@ -1097,6 +1115,14 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 result,
                 self.agent.library if self.agent is not None else None,
             )
+            review_text = render_human_review_text(report)
+            if output_path is not None:
+                review_text += (
+                    f"\n\n结果目录：{output_path.parent}"
+                    f"\n可编辑明细：{output_path.parent / 'evaluation' / 'human_review_template.csv'}"
+                    f"\n横向对比：{output_path.parent / 'evaluation' / 'human_review_matrix.csv'}"
+                )
+            self.query_one("#human-review", _CopyableTextArea).update(review_text)
             self.candidates_log.clear()
             self._reset_candidate_table()
             if resolution is None:
@@ -1116,7 +1142,8 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 if matching:
                     lines.append(
                         f"匹配评价：{matching.get('confidence_label', '未评价')} "
-                        f"（分数信号 {float(matching.get('confidence', 0.0) or 0.0):.2f}）"
+                        f"（决策分 {float(matching.get('confidence', 0.0) or 0.0):.2f}；"
+                        f"IR证据完整度 {float(matching.get('evidence_completeness', 0.0) or 0.0):.2f}）"
                     )
                     confidence_reasons = matching.get("confidence_reasons") or []
                     if confidence_reasons:
@@ -1282,6 +1309,8 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         scenario_id,
                         self._clip(scenario_name, 34),
                         f"{score:.2f}",
+                        f"{float(details.get('fit_score', 0.0) or 0.0):.2f}",
+                        f"{float(details.get('evidence_completeness', 0.0) or 0.0):.2f}",
                         self._clip(str(details.get("evaluation") or "未评价"), 16),
                         self._clip("、".join(str(item) for item in matched_dimensions) or "-"),
                         self._clip("；".join(details.get("low_score_reasons", [])) or "-", 42),
@@ -1294,11 +1323,13 @@ if _TEXTUAL_IMPORT_ERROR is None:
                     )
                     if details.get("evaluation"):
                         self.candidates_log.write(f"   评价：{details['evaluation']}")
-                    base_score = float(details.get("base_score", 0.0) or 0.0)
-                    consistency_bonus = float(details.get("consistency_bonus", 0.0) or 0.0)
+                    fit_score = float(details.get("fit_score", 0.0) or 0.0)
+                    evidence_completeness = float(
+                        details.get("evidence_completeness", 0.0) or 0.0
+                    )
                     self.candidates_log.write(
-                        f"   评分构成：基础分 {base_score:.2f} + "
-                        f"一致性加分 {consistency_bonus:.2f} = {score:.2f}"
+                        f"   评分：决策分 {score:.2f}；可用证据匹配度 {fit_score:.2f}；"
+                        f"证据完整度 {evidence_completeness:.2f}"
                     )
                     for dimension_line in self._format_dimension_scores(
                         details.get("dimension_scores")
@@ -1373,6 +1404,8 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 "SC",
                 "场景名称",
                 "分数",
+                "可用证据",
+                "证据完整",
                 "评价",
                 "命中维度",
                 "低分原因",
@@ -1382,7 +1415,16 @@ if _TEXTUAL_IMPORT_ERROR is None:
             use_case_table = self.use_case_table
             use_case_table.clear(columns=True)
             use_case_table.add_columns(
-                "序号", "UC", "用例名称", "分数", "评价", "父 SC", "低分原因", "命中词"
+                "序号",
+                "UC",
+                "用例名称",
+                "分数",
+                "可用证据",
+                "证据完整",
+                "评价",
+                "父 SC",
+                "低分原因",
+                "命中词",
             )
 
         def _write_use_case_candidates(self, result: Any) -> None:
@@ -1392,7 +1434,7 @@ if _TEXTUAL_IMPORT_ERROR is None:
             )
             raw_matches = report.get("use_cases", {}).get("matches", [])
             seen: set[str] = set()
-            rows: list[tuple[str, str, str, str, str, str, str]] = []
+            rows: list[tuple[str, str, str, str, str, str, str, str, str]] = []
             for item in raw_matches:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
@@ -1408,6 +1450,8 @@ if _TEXTUAL_IMPORT_ERROR is None:
                         use_case_id,
                         str(item.get("name") or use_case_id),
                         f"{float(item.get('score', 0.0) or 0.0):.2f}",
+                        f"{float(item.get('fit_score', 0.0) or 0.0):.2f}",
+                        f"{float(item.get('evidence_completeness', 0.0) or 0.0):.2f}",
                         str(item.get("evaluation") or "未评价"),
                         parent_id,
                         self._clip(
@@ -1421,14 +1465,31 @@ if _TEXTUAL_IMPORT_ERROR is None:
             if not rows:
                 self.candidates_log.write("本轮没有结构化 UC 候选。")
                 return
-            for index, (use_case_id, name, score, evaluation, parent_id, low_score_reasons, matched_terms) in enumerate(
+            for index, (
+                use_case_id,
+                name,
+                score,
+                fit_score,
+                evidence_completeness,
+                evaluation,
+                parent_id,
+                low_score_reasons,
+                matched_terms,
+            ) in enumerate(
                 rows, start=1
             ):
+                item = next(
+                    candidate
+                    for candidate in raw_matches
+                    if isinstance(candidate, dict) and str(candidate.get("id")) == use_case_id
+                )
                 self.use_case_table.add_row(
                     str(index),
                     use_case_id,
                     self._clip(name, 34),
                     score,
+                    fit_score,
+                    evidence_completeness,
                     self._clip(evaluation, 16),
                     parent_id,
                     low_score_reasons,
@@ -1438,16 +1499,13 @@ if _TEXTUAL_IMPORT_ERROR is None:
                 self.candidates_log.write(
                     f"UC {use_case_id} | 分数 {score} | 评价 {evaluation} | 父 SC {parent_id}"
                 )
-                item = next(
-                    candidate
-                    for candidate in raw_matches
-                    if isinstance(candidate, dict) and str(candidate.get("id")) == use_case_id
+                fit_score = float(item.get("fit_score", 0.0) or 0.0)
+                evidence_completeness = float(
+                    item.get("evidence_completeness", 0.0) or 0.0
                 )
-                base_score = float(item.get("base_score", 0.0) or 0.0)
-                consistency_bonus = float(item.get("consistency_bonus", 0.0) or 0.0)
                 self.candidates_log.write(
-                    f"   评分构成：基础分 {base_score:.2f} + "
-                    f"一致性加分 {consistency_bonus:.2f} = {score}"
+                    f"   评分：决策分 {score}；可用证据匹配度 {fit_score:.2f}；"
+                    f"证据完整度 {evidence_completeness:.2f}"
                 )
                 for dimension_line in self._format_dimension_scores(
                     item.get("dimension_scores")
@@ -1487,8 +1545,9 @@ if _TEXTUAL_IMPORT_ERROR is None:
                             str(value) for value in item.get("matched_terms", [])
                         ],
                         "base_score": float(item.get("base_score", 0.0) or 0.0),
-                        "consistency_bonus": float(
-                            item.get("consistency_bonus", 0.0) or 0.0
+                        "fit_score": float(item.get("fit_score", 0.0) or 0.0),
+                        "evidence_completeness": float(
+                            item.get("evidence_completeness", 0.0) or 0.0
                         ),
                         "evaluation": str(item.get("evaluation") or "未评价"),
                         "dimension_scores": item.get("dimension_scores") or {},
@@ -1569,6 +1628,14 @@ if _TEXTUAL_IMPORT_ERROR is None:
 
         def _set_input_meta(self, text: str) -> None:
             self.query_one("#input-meta", _CopyableTextArea).update(text)
+
+        def _open_review_csv(self) -> None:
+            if self._last_output_path is None:
+                self.notify("当前还没有可打开的复核表。", severity="warning")
+                return
+            self._open_result_path(
+                self._last_output_path.parent / "evaluation" / "human_review_template.csv"
+            )
 
         def _open_result_path(self, path: Path | None) -> None:
             if path is None:

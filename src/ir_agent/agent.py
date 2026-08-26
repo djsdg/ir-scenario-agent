@@ -308,7 +308,7 @@ DEFAULT_INSTRUCTIONS = """
 
 工作规则：
 1. 从 IR 原文抽取 code/title/description/source、Who/When/Where/What/How/Why/How Much、约束和 DFX。原文为空的字段使用 null 或空数组，不得猜测。
-2. 有完整 IR 时必须先调用 match_ir_requirement；如果用户只提供 SC 描述，调用 match_scenario；如果只提供 UC 行为链，调用 match_use_case；如果用户指定某个 SC 做符合度/测试评估，调用 evaluate_scenario_fit；只有需要原始候选列表的零散查询才调用 search_scenarios 或 search_use_cases。不要凭记忆声称场景或 UC 存在。
+2. IR 的 5W2H 中只有 Who 和 What 是匹配前的必填字段；When、Where、How、Why、How Much 可以为空，并可由标题、描述、约束、DFX 和已提供字段辅助推断 SC 候选。有 Who 和 What 的 IR 必须先调用 match_ir_requirement；如果用户只提供 SC 描述，调用 match_scenario；如果只提供 UC 行为链，调用 match_use_case；如果用户指定某个 SC 做符合度/测试评估，调用 evaluate_scenario_fit；只有需要原始候选列表的零散查询才调用 search_scenarios 或 search_use_cases。不要凭记忆声称场景或 UC 存在。
 3. 匹配必须同时检查：目标与故障表现、Actor、生命周期/上下文、影响因素/部件、约束，以及 UC 的触发→处理→保证链路；最终说明每个 SC/UC 实际命中了哪些字段和证据词，不要只报分数。
 4. match_ir_requirement 的 decision 有四种：reuse_scenario_and_uc、reuse_scenario_create_uc、create_scenario_and_uc、needs_clarification。遵循工具结论，并说明差异；如果工具返回硬冲突或 ambiguous=true，不得自动复用，必须请求人工确认。
 5. 场景必须遵循当前 active_business_spec：description、category、business_goal、actor、actions、influence_factors、lifecycle、constraints、owner 都要有；每个 influence_factor 必须有 kind、dimension、name 和至少一个 selected_value。缺任一项时不得调用 create_scenario。

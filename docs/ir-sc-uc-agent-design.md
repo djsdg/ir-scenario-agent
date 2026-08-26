@@ -84,7 +84,7 @@ Agent 会尝试抽取：
 - `constraints`；
 - 性能、可靠性、可服务性、可维护性、可销售性、交付时间和标签。
 
-对于完整 IR，`who/when/where/what/how/why/how_much` 是匹配所需的核心字段。缺失时，Agent 返回 `needs_clarification`，不会直接新建。
+IR 的 5W2H 中，只有 `who` 和 `what` 是匹配必填字段。`when/where/how/why/how_much` 缺失时，Agent 仍会结合标题、描述、约束、DFX 和已提供字段进行 SC 候选匹配与草稿推断，并把对应字段标为“推断/待人工确认”。只有 `who` 或 `what` 缺失时才因 IR 信息不足返回 `needs_clarification`。SC/UC 的写入必填字段仍必须在写库前补齐。
 
 ### 4.2 SC 必填字段
 
@@ -152,7 +152,7 @@ match_ir_requirement
 它会同时匹配 SC 和 UC，并返回：
 
 - `scenario_matches`：候选 SC、分数、命中词、字段级命中证据、命中维度、未覆盖维度和冲突；
-- 每个 SC/UC 候选还返回 `base_score`、`consistency_bonus`、`evaluation`、`dimension_scores` 和 `low_score_reasons`，可以看到分数构成、各维度证据和低分原因；
+- 每个 SC/UC 候选还返回 `score`（保守决策分）、`fit_score`（仅在可用 IR 证据上的匹配度，包含可追溯文本推断）、`evidence_completeness`（IR 覆盖的判断维度比例）、`evaluation`、`dimension_scores` 和 `low_score_reasons`。这样不会把未填写的可选字段误当成不匹配，也不会因字段缺失虚高复用结论；
 - `use_case_matches`：选中候选 SC 的子 UC、分数、字段级命中证据和父 SC；如果没有 SC 候选，才回退到全库 UC 候选；
 - `decision`：复用/新增/待澄清；
 - `confidence`：最高候选 SC 分数；
@@ -170,11 +170,11 @@ match_ir_requirement
 |---|---:|---|
 | 目标/行为意图 | 0.45 | title、description、what、why、how 与 SC 名称、描述、目标、动作、标签 |
 | Actor | 0.15 | IR 的 who 与 SC actor |
-| 生命周期/上下文 | 0.10 | when、where 与 SC lifecycle、描述、影响部件 |
-| 影响因素 | 0.10 | where、description、constraints、how_much 与影响因素、部件 |
+| 生命周期/上下文 | 0.15 | when 或描述中可识别的生命周期词，与 SC lifecycle |
+| 影响因素 | 0.15 | where 或描述中可识别的部件词，与影响因素、部件 |
 | 约束 | 0.10 | IR constraints/how_much 与 SC constraints |
 
-计算后，如果多个维度同时命中，会额外增加少量一致性分，最终分数限制在 `0~1`。
+每个字段使用“IR 覆盖度为主、候选字段反向覆盖为辅”的对齐分，避免长 IR 因背景文字多而被无谓压低。最终不再按命中维度数量增加固定分：`score` 保持全维度权重，`fit_score` 只归一化已提供维度，`evidence_completeness` 单独反映证据量。
 
 报告会把每个维度拆成 `score × weight = weighted_score`，并同时保留证据、等级（强/部分/弱/缺失/未提供）和文字原因。`confidence_label` 是基于阈值、硬冲突、关键缺口和候选分差计算出的可读评价，不是大模型自由生成的概率。
 
@@ -231,6 +231,8 @@ UC 有两种入口：
 
 传入 `null` 表示在整个 UC 库中匹配；传入 SC ID 后，只匹配这个 SC 已关联的 UC。这样可以避免从全库选到语义相近、但不属于当前场景的 UC。
 
+当通过 `match_ir_requirement` 由 IR 匹配 UC 时，系统不再只把 IR 和 UC 拼成一段全文，而是分别比较：`目标/行为`、`Actor`、`触发/前置`、`处理步骤`、`保证/DFX`、`约束`。只有 UC 的触发、处理和保证链路都有足够的已提供证据时，才会复用已有 UC；仅有 SC 相似时会建议在该 SC 下新增 UC。
+
 ### 5.5 当前匹配阈值和决策
 
 完整 IR 的默认决策规则如下：
@@ -241,8 +243,9 @@ UC 有两种入口：
 | 最高 SC 分数 `< 0.45` | `create_scenario_and_uc` |
 | Actor、生命周期、影响部件或范围出现明确硬冲突 | `needs_clarification` |
 | 最高候选与次高候选分差 `< 0.08`，且最高分达到复用线 | `needs_clarification` |
+| SC 候选达到复用线，但 IR 证据完整度 `< 0.60` | `needs_clarification`（保留候选供人工复核） |
 | SC 分数达到复用线，但没有覆盖行为链的子 UC | `reuse_scenario_create_uc` |
-| SC 分数 `≥ 0.70`，且父 SC 子 UC 分数 `≥ 0.45` | `reuse_scenario_and_uc` |
+| SC 分数 `≥ 0.70`，且父 SC 子 UC 分数 `≥ 0.45`、UC 证据完整度 `≥ 0.70` | `reuse_scenario_and_uc` |
 
 这里的分数是当前轻量检索器的匹配置信号，不是统计学概率，也不是最终业务结论。硬冲突和关键维度缺口检查优先于分数；候选分差过小时不自动复用。阈值和领域词表由 `config/ir_sc_uc_spec.json` 的 `matching` 段控制，后续仍可以把召回层替换为 BM25、Embedding、Reranker 或企业检索服务。
 
@@ -374,14 +377,18 @@ Constraints: 只监控 IO 进程；事后检测；数据修复不在范围；可
 ├── report.md         # 人工阅读报告
 ├── evaluation/       # 评分明细和人工复核 CSV
 │   ├── match_summary.csv
+│   ├── review_candidates.json
 │   ├── field_comparison.csv
 │   ├── human_review_template.csv
+│   ├── human_review_matrix.csv
 │   └── scenario_fit.csv
 ├── scenarios/        # SC 命中、选中、新建、更新快照
 └── use_cases/        # UC 命中、选中、新建、更新和按父 SC 分组快照
 ```
 
 一个 SC 下的多个 UC 会在 `use_cases/by_scenario/<SC-ID>.json` 中逐项列出。若用户明确要求新增或更新并通过审批，写入工具会修改原场景库；结果目录是本轮操作的证据快照，不能替代原库。
+
+人工复核采用“两层展示”：`report.md` 先展示候选总览，再按 SC 分组展示字段明细；`human_review_template.csv` 是逐候选逐字段的回填模板，`human_review_matrix.csv` 是两个候选的横向比较模板。填写后使用 `ir-agent --apply-review <csv> --review-report <report.json>` 生成新的复核报告，回填只改变报告，不会绕过审批写入场景库。
 
 ## 8. 写入、审批和追溯
 

@@ -531,7 +531,8 @@ class ToolRegistry:
                 name="match_ir_requirement",
                 description=(
                     "Normalize and match one IR against scenarios and use cases using 5W2H, actor, "
-                    "lifecycle, influence factors, constraints, triggers, and guarantees. Always call this first."
+                    "lifecycle, influence factors, constraints, triggers, and guarantees. Only Who and What "
+                    "are mandatory; infer candidates from the remaining supplied IR content. Always call this first."
                 ),
                 parameters=_match_ir_parameters(),
                 input_model=MatchIRArgs,

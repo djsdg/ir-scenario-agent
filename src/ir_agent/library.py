@@ -15,9 +15,9 @@ from .domain import (
     CreateScenarioRequest,
     CreateUseCaseRequest,
     DimensionScore,
+    InformationRequirement,
     IRMatchResult,
     IRRequirementInput,
-    InformationRequirement,
     MoveUseCaseRequest,
     Scenario,
     ScenarioMatch,
@@ -104,13 +104,26 @@ _SCENARIO_REUSE_THRESHOLD = 0.45
 _SCENARIO_STRONG_THRESHOLD = 0.70
 _USE_CASE_REUSE_THRESHOLD = 0.45
 _AMBIGUITY_MARGIN_THRESHOLD = 0.08
+_SCENARIO_REUSE_MIN_EVIDENCE_COMPLETENESS = 0.60
+_USE_CASE_REUSE_MIN_EVIDENCE_COMPLETENESS = 0.70
+_FIELD_PRECISION_BLEND_WEIGHT = 0.60
 _CRITICAL_DIMENSIONS_FOR_REUSE = ("Actor", "上下文", "影响因素")
+_REQUIRED_IR_FIELDS = ("who", "what")
+_IR_5W2H_FIELDS = ("who", "when", "where", "what", "how", "why", "how_much")
 _IR_DIMENSION_WEIGHTS: dict[str, float] = {
     "目标/行为": 0.45,
     "Actor": 0.15,
     "上下文": 0.15,
     "影响因素": 0.15,
     "约束": 0.10,
+}
+_UC_DIMENSION_WEIGHTS: dict[str, float] = {
+    "目标/行为": 0.30,
+    "Actor": 0.10,
+    "触发/前置": 0.20,
+    "处理步骤": 0.20,
+    "保证/DFX": 0.12,
+    "约束": 0.08,
 }
 
 
@@ -176,23 +189,61 @@ def _configured_weight(rules: dict[str, object], key: str, default: float) -> fl
     return value if value >= 0.0 else default
 
 
-def _configured_dimension_weights(rules: dict[str, object]) -> dict[str, float]:
-    """Return normalized IR dimension weights from the active Spec."""
+def _configured_dimension_weights(
+    rules: dict[str, object],
+    *,
+    key: str = "ir_dimension_weights",
+    defaults: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Return normalized named dimension weights from the active Spec."""
 
-    raw = rules.get("ir_dimension_weights")
-    weights = dict(_IR_DIMENSION_WEIGHTS)
+    defaults = defaults or _IR_DIMENSION_WEIGHTS
+    raw = rules.get(key)
+    weights = dict(defaults)
     if isinstance(raw, dict):
-        for name in weights:
+        for name, default_value in weights.items():
             try:
-                value = float(raw.get(name, weights[name]))
+                value = float(raw.get(name, default_value))
             except (TypeError, ValueError):
-                value = weights[name]
+                value = default_value
             if value >= 0.0:
                 weights[name] = value
     total = sum(weights.values())
     if total <= 0.0:
-        return dict(_IR_DIMENSION_WEIGHTS)
+        return dict(defaults)
     return {name: value / total for name, value in weights.items()}
+
+
+def _evidence_metrics(
+    values: dict[str, float],
+    supplied: dict[str, bool],
+    weights: dict[str, float],
+) -> tuple[float, float, float]:
+    """Return conservative score, supplied-evidence fit, and completeness.
+
+    The conservative score retains the full configured weight scale for
+    decision thresholds. The fit score normalizes only the fields the IR
+    actually supplied, while completeness tells a reviewer how much of the
+    SC/UC decision model was available. This keeps optional IR fields useful
+    without allowing their absence to masquerade as a positive match.
+    """
+
+    completeness = sum(
+        max(0.0, float(weights.get(name, 0.0)))
+        for name, is_supplied in supplied.items()
+        if is_supplied
+    )
+    conservative_score = sum(
+        max(0.0, min(1.0, float(values.get(name, 0.0))))
+        * max(0.0, float(weights.get(name, 0.0)))
+        for name in values
+    )
+    fit_score = conservative_score / completeness if completeness > 0.0 else 0.0
+    return (
+        min(1.0, conservative_score),
+        min(1.0, fit_score),
+        min(1.0, completeness),
+    )
 
 
 def _dimension_level(score: float, supplied: bool) -> str:
@@ -322,6 +373,68 @@ def _category_hits(text: str, categories: dict[str, tuple[str, ...]]) -> set[str
     }
 
 
+def _category_terms(text: str, categories: dict[str, tuple[str, ...]]) -> list[str]:
+    """Extract configured taxonomy terms found in free-text IR evidence."""
+
+    normalized = _compact(text)
+    terms: list[str] = []
+    for values in categories.values():
+        for term in values:
+            value = str(term).strip()
+            if value and _compact(value) in normalized:
+                terms.append(value)
+    return list(dict.fromkeys(terms))
+
+
+def _ir_dfx_values(ir: IRRequirementInput) -> list[str]:
+    return [
+        value.strip()
+        for value in (
+            ir.performance,
+            ir.reliability,
+            ir.serviceability,
+            ir.maintainability,
+            ir.sales,
+            ir.delivery_time,
+        )
+        if value and value.strip()
+    ]
+
+
+def _uc_trigger_evidence(
+    ir: IRRequirementInput,
+    lifecycle_categories: dict[str, tuple[str, ...]],
+) -> str:
+    """Keep SC lifecycle text out of UC trigger matching when it is only context."""
+
+    raw_when = (ir.when or "").strip()
+    if not raw_when:
+        return ""
+    residual = raw_when
+    for terms in lifecycle_categories.values():
+        for term in terms:
+            value = str(term).strip()
+            if value:
+                residual = re.sub(re.escape(value), " ", residual, flags=re.IGNORECASE)
+    compact_residual = _compact(residual)
+    trigger_markers = (
+        "异常",
+        "故障",
+        "提交",
+        "请求",
+        "触发",
+        "告警",
+        "复位",
+        "core",
+        "错误",
+        "失败",
+        "启动",
+        "达到",
+        "出现",
+    )
+    return raw_when if any(marker in compact_residual for marker in trigger_markers) else ""
+
+
 def _exclusive_conflict(
     query: str,
     document: str,
@@ -401,6 +514,28 @@ def _coverage(
     total_weight = sum(_token_weight(token) for token in query_terms)
     matched_weight = sum(_token_weight(token) for token in matched)
     return (matched_weight / total_weight if total_weight else 0.0), matched
+
+
+def _aligned_coverage(
+    query: str,
+    document: str,
+    *,
+    synonyms: dict[str, tuple[str, ...]] | None = None,
+    precision_blend_weight: float = _FIELD_PRECISION_BLEND_WEIGHT,
+) -> tuple[float, set[str]]:
+    """Score query evidence without over-penalizing a detailed IR.
+
+    Query coverage remains the primary signal. Capped reverse coverage adds
+    credit only when the candidate's own field terms are also found in the IR.
+    This replaces the old fixed bonus per matched dimension and is traceable
+    through the returned matched tokens.
+    """
+
+    recall, forward_terms = _coverage(query, document, synonyms=synonyms)
+    precision, reverse_terms = _coverage(document, query, synonyms=synonyms)
+    blend = max(0.0, min(1.0, float(precision_blend_weight)))
+    score = recall + (1.0 - recall) * precision * blend
+    return min(1.0, score), forward_terms | reverse_terms
 
 
 def _field_evidence(
@@ -909,6 +1044,8 @@ class ScenarioLibrary:
                             scenario,
                             synonyms=synonyms,
                         ),
+                        fit_score=round(score, 4),
+                        evidence_completeness=1.0,
                         base_score=round(score, 4),
                         evaluation=_scenario_evaluation(
                             score,
@@ -946,7 +1083,6 @@ class ScenarioLibrary:
             if scenario_id not in scenarios:
                 raise ValueError(f"Unknown scenario id: {scenario_id}")
             allowed_use_case_ids = set(scenarios[scenario_id].use_case_ids)
-        query_terms = set(tokenize(query))
         rules = self.matching_rules()
         synonyms = _configured_synonyms(rules)
         lexical_weight = _configured_weight(rules, "lexical_weight", 0.75)
@@ -1011,6 +1147,8 @@ class ScenarioLibrary:
                             synonyms=synonyms,
                         ),
                         parent_scenario_id=scenario_id or parent_by_use_case.get(use_case.id),
+                        fit_score=round(score, 4),
+                        evidence_completeness=1.0,
                         base_score=round(score, 4),
                         evaluation=_scenario_evaluation(
                             score,
@@ -1026,6 +1164,182 @@ class ScenarioLibrary:
                     )
                 )
         matches.sort(key=lambda item: (-item.score, item.use_case.name))
+        return matches[:top_k]
+
+    def _match_use_cases_for_ir(
+        self,
+        ir: IRRequirementInput,
+        *,
+        scenario_id: str | None,
+        top_k: int,
+        min_score: float,
+        rules: dict[str, object],
+        synonyms: dict[str, tuple[str, ...]],
+        actor_categories: dict[str, tuple[str, ...]],
+        precision_blend_weight: float,
+    ) -> list[UseCaseMatch]:
+        """Compare an IR to UC fields as a behavior contract, not one blob."""
+
+        allowed_use_case_ids: set[str] | None = None
+        parent_by_use_case: dict[str, str] = {}
+        scenarios = {scenario.id: scenario for scenario in self.list_scenarios()}
+        if scenario_id:
+            if scenario_id not in scenarios:
+                raise ValueError(f"Unknown scenario id: {scenario_id}")
+            allowed_use_case_ids = set(scenarios[scenario_id].use_case_ids)
+        for scenario in scenarios.values():
+            for use_case_id in scenario.use_case_ids:
+                parent_by_use_case.setdefault(use_case_id, scenario.id)
+
+        dimension_weights = _configured_dimension_weights(
+            rules,
+            key="uc_dimension_weights",
+            defaults=_UC_DIMENSION_WEIGHTS,
+        )
+        lifecycle_categories = _configured_categories(
+            rules,
+            "lifecycle_categories",
+            _LIFECYCLE_CATEGORIES,
+        )
+        dfx_values = _ir_dfx_values(ir)
+        intent_query = " ".join([ir.title, ir.description, ir.what or "", ir.why or "", *ir.how])
+        trigger_query = _uc_trigger_evidence(ir, lifecycle_categories)
+        process_query = " ".join(ir.how)
+        guarantee_query = " ".join([*ir.how_much, *dfx_values])
+        constraint_query = " ".join(ir.constraints)
+        matches: list[UseCaseMatch] = []
+
+        for use_case in self.list_use_cases():
+            if allowed_use_case_ids is not None and use_case.id not in allowed_use_case_ids:
+                continue
+            intent_score, intent_terms = _aligned_coverage(
+                intent_query,
+                " ".join(
+                    [
+                        use_case.name,
+                        use_case.description,
+                        use_case.catalog or "",
+                        *use_case.tags,
+                    ]
+                ),
+                synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
+            )
+            actor_score, actor_terms = _aligned_coverage(
+                ir.who or "",
+                use_case.actor,
+                synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
+            )
+            trigger_score, trigger_terms = _aligned_coverage(
+                trigger_query,
+                " ".join([use_case.trigger_event, *use_case.preconditions]),
+                synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
+            )
+            process_score, process_terms = _aligned_coverage(
+                process_query,
+                " ".join([*use_case.main_success_scenario, *use_case.extension_scenarios]),
+                synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
+            )
+            guarantee_score, guarantee_terms = _aligned_coverage(
+                guarantee_query,
+                " ".join(
+                    [
+                        use_case.success_guarantee,
+                        use_case.minimum_guarantee,
+                        *use_case.dfx,
+                    ]
+                ),
+                synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
+            )
+            constraint_score, constraint_terms = _aligned_coverage(
+                constraint_query,
+                " ".join(use_case.constraints),
+                synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
+            )
+            dimension_values = {
+                "目标/行为": intent_score,
+                "Actor": actor_score,
+                "触发/前置": trigger_score,
+                "处理步骤": process_score,
+                "保证/DFX": guarantee_score,
+                "约束": constraint_score,
+            }
+            dimension_evidence = {
+                "目标/行为": intent_terms,
+                "Actor": actor_terms,
+                "触发/前置": trigger_terms,
+                "处理步骤": process_terms,
+                "保证/DFX": guarantee_terms,
+                "约束": constraint_terms,
+            }
+            dimension_supplied = {
+                "目标/行为": bool(intent_query.strip()),
+                "Actor": bool(ir.who and ir.who.strip()),
+                "触发/前置": bool(trigger_query.strip()),
+                "处理步骤": bool(process_query.strip()),
+                "保证/DFX": bool(guarantee_query.strip()),
+                "约束": bool(constraint_query.strip()),
+            }
+            dimension_scores, low_score_reasons = _build_dimension_scores(
+                dimension_values,
+                dimension_evidence,
+                dimension_supplied,
+                dimension_weights,
+            )
+            base_score, fit_score, evidence_completeness = _evidence_metrics(
+                dimension_values,
+                dimension_supplied,
+                dimension_weights,
+            )
+            if base_score < min_score:
+                continue
+            gaps = [
+                f"{name}未覆盖"
+                for name, value in dimension_values.items()
+                if dimension_supplied[name] and value <= 0.0
+            ]
+            conflicts: list[str] = []
+            if _exclusive_conflict(ir.who or "", use_case.actor, actor_categories):
+                conflicts.append("Actor 明确冲突")
+            matches.append(
+                UseCaseMatch(
+                    use_case=use_case,
+                    score=round(base_score, 4),
+                    matched_terms=sorted(set().union(*dimension_evidence.values())),
+                    matched_fields={
+                        name: sorted(terms)
+                        for name, terms in dimension_evidence.items()
+                        if terms
+                    },
+                    matched_dimensions=[
+                        name for name, value in dimension_values.items() if value > 0.0
+                    ],
+                    gaps=gaps,
+                    conflicts=conflicts,
+                    parent_scenario_id=scenario_id or parent_by_use_case.get(use_case.id),
+                    fit_score=round(fit_score, 4),
+                    evidence_completeness=round(evidence_completeness, 4),
+                    base_score=round(base_score, 4),
+                    consistency_bonus=0.0,
+                    evaluation=_scenario_evaluation(
+                        base_score,
+                        reuse_threshold=_configured_threshold(
+                            rules, "use_case_reuse_threshold", _USE_CASE_REUSE_THRESHOLD
+                        ),
+                        strong_threshold=_SCENARIO_STRONG_THRESHOLD,
+                        conflicts=conflicts,
+                        low_score_reasons=low_score_reasons,
+                    ),
+                    dimension_scores=dimension_scores,
+                    low_score_reasons=low_score_reasons,
+                )
+            )
+        matches.sort(key=lambda item: (-item.score, -item.fit_score, item.use_case.name))
         return matches[:top_k]
 
     def match_ir(
@@ -1051,6 +1365,21 @@ class ScenarioLibrary:
         ambiguity_margin_threshold = _configured_threshold(
             rules, "ambiguity_margin", _AMBIGUITY_MARGIN_THRESHOLD
         )
+        scenario_min_evidence_completeness = _configured_threshold(
+            rules,
+            "scenario_reuse_min_evidence_completeness",
+            _SCENARIO_REUSE_MIN_EVIDENCE_COMPLETENESS,
+        )
+        use_case_min_evidence_completeness = _configured_threshold(
+            rules,
+            "use_case_reuse_min_evidence_completeness",
+            _USE_CASE_REUSE_MIN_EVIDENCE_COMPLETENESS,
+        )
+        precision_blend_weight = _configured_threshold(
+            rules,
+            "field_precision_blend_weight",
+            _FIELD_PRECISION_BLEND_WEIGHT,
+        )
         actor_categories = _configured_categories(
             rules, "actor_categories", _ACTOR_CATEGORIES
         )
@@ -1065,14 +1394,40 @@ class ScenarioLibrary:
             "critical_dimensions_for_reuse",
             _CRITICAL_DIMENSIONS_FOR_REUSE,
         )
+        required_ir_fields = tuple(
+            field
+            for field in _configured_strings(
+                rules,
+                "required_ir_fields",
+                _REQUIRED_IR_FIELDS,
+            )
+            if field in _IR_5W2H_FIELDS
+        ) or _REQUIRED_IR_FIELDS
         dimension_weights = _configured_dimension_weights(rules)
+        intent_query = " ".join(
+            [ir.title, ir.description, ir.what or "", ir.why or "", *ir.how]
+        )
+        inference_text = " ".join(
+            [ir.title, ir.description, ir.what or "", ir.why or "", *ir.how, *ir.constraints, *ir.tags]
+        )
+        context_query = " ".join(
+            [ir.when or "", *_category_terms(inference_text, lifecycle_categories)]
+        )
+        impact_query = " ".join(
+            [ir.where or "", *_category_terms(inference_text, component_categories)]
+        )
+        constraint_query = " ".join([*ir.constraints, *ir.how_much])
+        dimension_supplied = {
+            "目标/行为": bool(intent_query.strip()),
+            "Actor": bool(ir.who and ir.who.strip()),
+            "上下文": bool(context_query.strip()),
+            "影响因素": bool(impact_query.strip()),
+            "约束": bool(constraint_query.strip()),
+        }
         matches: list[ScenarioMatch] = []
         for scenario in self.list_scenarios():
             if scenario_ids is not None and scenario.id not in scenario_ids:
                 continue
-            intent_query = " ".join(
-                [ir.title, ir.description, ir.what or "", ir.why or "", *ir.how]
-            )
             intent_document = " ".join(
                 [
                     scenario.name,
@@ -1083,37 +1438,45 @@ class ScenarioLibrary:
                     *scenario.tags,
                 ]
             )
-            actor_score, actor_terms = _coverage(
-                ir.who or "", scenario.actor, synonyms=synonyms
+            actor_score, actor_terms = _aligned_coverage(
+                ir.who or "",
+                scenario.actor,
+                synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
             )
-            context_score, context_terms = _coverage(
-                " ".join([ir.when or "", ir.where or ""]),
+            context_score, context_terms = _aligned_coverage(
+                context_query,
                 " ".join(
                     [
                         scenario.lifecycle or "",
-                        scenario.description,
-                        *scenario.affected_components,
+                        *_category_terms(scenario.description, lifecycle_categories),
                     ]
                 ),
                 synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
             )
             impact_values = [
                 value
                 for factor in scenario.influence_factors
                 for value in [factor.name, *factor.candidate_values, *factor.selected_values]
             ]
-            impact_score, impact_terms = _coverage(
-                " ".join([ir.where or "", ir.description, *ir.constraints, *ir.how_much]),
-                " ".join([*impact_values, *scenario.affected_components]),
+            impact_score, impact_terms = _aligned_coverage(
+                impact_query,
+                " ".join([*impact_values, *scenario.affected_components, *scenario.constraints]),
                 synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
             )
-            constraint_score, constraint_terms = _coverage(
-                " ".join([*ir.constraints, *ir.how_much]),
+            constraint_score, constraint_terms = _aligned_coverage(
+                constraint_query,
                 " ".join(scenario.constraints),
                 synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
             )
-            intent_score, intent_terms = _coverage(
-                intent_query, intent_document, synonyms=synonyms
+            intent_score, intent_terms = _aligned_coverage(
+                intent_query,
+                intent_document,
+                synonyms=synonyms,
+                precision_blend_weight=precision_blend_weight,
             )
             dimension_values = {
                 "目标/行为": intent_score,
@@ -1129,22 +1492,16 @@ class ScenarioLibrary:
                 "影响因素": impact_terms,
                 "约束": constraint_terms,
             }
-            dimension_supplied = {
-                "目标/行为": bool(intent_query.strip()),
-                "Actor": bool(ir.who),
-                "上下文": bool(ir.when or ir.where),
-                "影响因素": bool(ir.where or ir.constraints or ir.how_much),
-                "约束": bool(ir.constraints or ir.how_much),
-            }
             dimension_scores, low_score_reasons = _build_dimension_scores(
                 dimension_values,
                 dimension_evidence,
                 dimension_supplied,
                 dimension_weights,
             )
-            base_score = min(
-                1.0,
-                sum(item.weighted_score for item in dimension_scores.values()),
+            base_score, fit_score, evidence_completeness = _evidence_metrics(
+                dimension_values,
+                dimension_supplied,
+                dimension_weights,
             )
             dimensions = [
                 name for name, dimension_score in dimension_values.items() if dimension_score > 0
@@ -1154,11 +1511,7 @@ class ScenarioLibrary:
                 for name, dimension_score in dimension_values.items()
                 if dimension_supplied[name] and dimension_score <= 0
             ]
-
-            # Cross-field agreement is a small, explainable bonus.  It is
-            # reported separately so users can see where the total came from.
-            score = min(1.0, base_score + 0.04 * len(dimensions))
-            consistency_bonus = score - base_score
+            score = base_score
             if score < min_score:
                 continue
 
@@ -1189,8 +1542,10 @@ class ScenarioLibrary:
                     matched_dimensions=dimensions,
                     gaps=gaps,
                     conflicts=conflicts,
+                    fit_score=round(fit_score, 4),
+                    evidence_completeness=round(evidence_completeness, 4),
                     base_score=round(base_score, 4),
-                    consistency_bonus=round(consistency_bonus, 4),
+                    consistency_bonus=0.0,
                     evaluation=_scenario_evaluation(
                         score,
                         reuse_threshold=scenario_reuse_threshold,
@@ -1203,7 +1558,7 @@ class ScenarioLibrary:
                 )
             )
 
-        matches.sort(key=lambda item: (-item.score, item.scenario.name))
+        matches.sort(key=lambda item: (-item.score, -item.fit_score, item.scenario.name))
         ranked_matches = matches
         top_score = ranked_matches[0].score if ranked_matches else 0.0
         score_margin = (
@@ -1217,16 +1572,31 @@ class ScenarioLibrary:
             and score_margin < ambiguity_margin_threshold
         )
         matches = matches[:top_k]
-        global_use_case_matches = self.search_use_cases(
-            ir.search_text(), top_k=top_k, min_score=0.0
+        global_use_case_matches = self._match_use_cases_for_ir(
+            ir,
+            scenario_id=None,
+            top_k=top_k,
+            min_score=0.0,
+            rules=rules,
+            synonyms=synonyms,
+            actor_categories=actor_categories,
+            precision_blend_weight=precision_blend_weight,
         )
         use_case_matches = global_use_case_matches
-        missing_fields = ir.missing_fields()
+        missing_fields = ir.missing_fields(required_ir_fields)
+        optional_missing_fields = ir.missing_optional_fields(required_ir_fields)
         rationale: list[str] = []
         top_match = matches[0] if matches else None
         linked_matches: list[UseCaseMatch] = []
         critical_gaps: list[str] = []
+        scenario_evidence_is_limited = False
+        top_linked_use_case: UseCaseMatch | None = None
+        uc_critical_gaps: list[str] = []
         if top_match is not None:
+            scenario_evidence_is_limited = (
+                top_match.evidence_completeness + 1e-9
+                < scenario_min_evidence_completeness
+            )
             critical_gaps = [
                 gap
                 for gap in top_match.gaps
@@ -1235,17 +1605,32 @@ class ScenarioLibrary:
             # UC is a child of the selected SC. Search inside that parent's
             # children for the decision instead of filtering a global top-k
             # result, which could hide the relevant child UC.
-            linked_matches = self.search_use_cases(
-                ir.search_text(),
+            linked_matches = self._match_use_cases_for_ir(
+                ir,
                 scenario_id=top_match.scenario.id,
                 top_k=top_k,
                 min_score=0.0,
+                rules=rules,
+                synonyms=synonyms,
+                actor_categories=actor_categories,
+                precision_blend_weight=precision_blend_weight,
             )
             use_case_matches = linked_matches
+            top_linked_use_case = linked_matches[0] if linked_matches else None
+            if top_linked_use_case is not None:
+                uc_critical_gaps = [
+                    gap
+                    for gap in top_linked_use_case.gaps
+                    if gap.startswith(("触发/前置未", "处理步骤未", "保证/DFX未"))
+                ]
 
         if missing_fields:
             decision = "needs_clarification"
-            rationale.append(f"IR 缺少 5W2H 字段：{', '.join(missing_fields)}")
+            rationale.append(
+                "IR 缺少必填字段："
+                + ", ".join(missing_fields)
+                + "。当前规则仅要求 Who 和 What。"
+            )
         elif not matches or top_score < scenario_reuse_threshold:
             decision = "create_scenario_and_uc"
             rationale.append("没有达到可复用阈值的场景，需要新建场景并派生 UC 草稿。")
@@ -1257,6 +1642,13 @@ class ScenarioLibrary:
             rationale.append(
                 "候选场景未覆盖自动复用所需的关键维度：" + "、".join(critical_gaps)
             )
+        elif scenario_evidence_is_limited:
+            decision = "needs_clarification"
+            rationale.append(
+                "候选场景达到分数线，但 IR 证据完整度仅 "
+                f"{top_match.evidence_completeness:.2f}，低于场景复用门槛 "
+                f"{scenario_min_evidence_completeness:.2f}；保留候选并请求人工确认。"
+            )
         elif ambiguous:
             decision = "needs_clarification"
             rationale.append(
@@ -1265,26 +1657,51 @@ class ScenarioLibrary:
         else:
             if (
                 top_score >= scenario_strong_threshold
-                and linked_matches
-                and linked_matches[0].score >= use_case_reuse_threshold
+                and top_linked_use_case is not None
+                and top_linked_use_case.score >= use_case_reuse_threshold
+                and top_linked_use_case.evidence_completeness + 1e-9
+                >= use_case_min_evidence_completeness
+                and not top_linked_use_case.conflicts
+                and not uc_critical_gaps
             ):
                 decision = "reuse_scenario_and_uc"
                 rationale.append("场景关键维度一致，且已有 UC 已覆盖主要触发和处理链路。")
             else:
                 decision = "reuse_scenario_create_uc"
-                rationale.append("场景上下文可以复用，但没有足够匹配的 UC 覆盖完整行为链路。")
+                if top_linked_use_case is None:
+                    rationale.append("场景上下文可以复用，但该场景下没有可比较的 UC。")
+                else:
+                    rationale.append(
+                        "场景上下文可以复用，但 UC 未满足完整复用门控："
+                        f"分数 {top_linked_use_case.score:.2f}，"
+                        f"证据完整度 {top_linked_use_case.evidence_completeness:.2f}"
+                        f"（要求至少 {use_case_min_evidence_completeness:.2f}）。"
+                    )
+
+        if optional_missing_fields:
+            rationale.append(
+                "IR 未提供可选 5W2H 字段："
+                + ", ".join(optional_missing_fields)
+                + "；候选已基于标题、描述、Who、What、约束和 DFX 等已提供信息推断。"
+            )
 
         confidence_label = "无候选"
         confidence_reasons: list[str] = []
         if missing_fields:
             confidence_label = "信息不足"
-            confidence_reasons.append("IR 缺少必填 5W2H 字段，当前分数不能作为完整匹配结论。")
+            confidence_reasons.append("IR 缺少必填 Who/What 字段，当前不能形成场景匹配结论。")
         elif top_match is None:
             confidence_reasons.append("场景库没有返回候选 SC。")
-        elif top_match.conflicts or critical_gaps or ambiguous:
+        elif top_match.conflicts or critical_gaps or scenario_evidence_is_limited or ambiguous:
             confidence_label = "需人工确认"
             confidence_reasons.extend(top_match.conflicts)
             confidence_reasons.extend(critical_gaps)
+            if scenario_evidence_is_limited:
+                confidence_reasons.append(
+                    "IR 可用于候选排序，但场景复用证据完整度不足："
+                    f"{top_match.evidence_completeness:.2f} < "
+                    f"{scenario_min_evidence_completeness:.2f}。"
+                )
             if ambiguous:
                 confidence_reasons.append(f"最高候选与次高候选分差仅 {score_margin:.2f}。")
         elif top_score >= scenario_strong_threshold:
@@ -1297,7 +1714,17 @@ class ScenarioLibrary:
             confidence_label = "低分/建议新增"
             confidence_reasons.append("最高候选未达到场景复用线。")
         if top_match is not None:
+            confidence_reasons.append(
+                "IR 可用证据维度："
+                + "、".join(name for name, is_supplied in dimension_supplied.items() if is_supplied)
+                + f"；证据完整度 {top_match.evidence_completeness:.2f}；"
+                + f"可用证据匹配度 {top_match.fit_score:.2f}。"
+            )
             confidence_reasons.extend(top_match.low_score_reasons[:3])
+        if optional_missing_fields:
+            confidence_reasons.append(
+                "可选 5W2H 字段未完全提供，评分用于候选排序和场景推断；写入前仍需补齐 SC/UC 自身必填字段。"
+            )
 
         return IRMatchResult(
             ir=ir,
@@ -1306,6 +1733,13 @@ class ScenarioLibrary:
             use_case_matches=use_case_matches,
             decision=decision,
             confidence=round(top_score, 4),
+            evidence_completeness=round(
+                top_match.evidence_completeness if top_match is not None else 0.0,
+                4,
+            ),
+            supplied_dimensions=[
+                name for name, is_supplied in dimension_supplied.items() if is_supplied
+            ],
             score_margin=score_margin,
             ambiguous=ambiguous,
             confidence_label=confidence_label,
@@ -1333,6 +1767,8 @@ class ScenarioLibrary:
             "scenario": scenario.model_dump(mode="json"),
             "scenario_id": scenario_id,
             "score": match.score,
+            "fit_score": match.fit_score,
+            "evidence_completeness": match.evidence_completeness,
             "evaluation": match.evaluation,
             "dimension_scores": {
                 key: value.model_dump(mode="json")
@@ -1353,8 +1789,13 @@ class ScenarioLibrary:
                 in {
                     "scenario_reuse_threshold",
                     "scenario_strong_threshold",
+                    "scenario_reuse_min_evidence_completeness",
+                    "use_case_reuse_threshold",
+                    "use_case_reuse_min_evidence_completeness",
                     "ambiguity_margin",
+                    "field_precision_blend_weight",
                     "ir_dimension_weights",
+                    "uc_dimension_weights",
                 }
             },
         }

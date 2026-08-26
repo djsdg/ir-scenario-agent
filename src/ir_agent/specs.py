@@ -258,15 +258,32 @@ class SpecCatalog:
 
     def draft_scenario(self, ir: IRRequirementInput) -> dict[str, Any]:
         constraints = _unique([*ir.constraints, *ir.how_much])
+        actions = [item.strip() for item in ir.how if item.strip()]
+        inferred_fields: list[str] = []
+        if not actions and ir.what and ir.what.strip():
+            actions = [ir.what.strip()]
+            inferred_fields.append("actions ← what")
+
+        lifecycle = ir.when.strip() if ir.when and ir.when.strip() else None
+        if lifecycle is None:
+            lifecycle, lifecycle_basis = self._infer_lifecycle_from_ir(ir)
+            if lifecycle_basis:
+                inferred_fields.append(lifecycle_basis)
+
+        influence_factors = self.infer_influence_factors(ir)
+        if influence_factors and not (ir.where and ir.where.strip()):
+            inferred_fields.append("influence_factors ← 标题/描述/What/How 中的 Spec 关键词")
+        if constraints and not ir.constraints and ir.how_much:
+            inferred_fields.append("constraints ← how_much")
         draft = {
             "name": ir.title.strip(),
             "description": ir.description.strip(),
             "category": self.default_category,
             "business_goal": ir.what.strip() if ir.what else ir.title.strip(),
             "actor": ir.who.strip() if ir.who else None,
-            "actions": [item.strip() for item in ir.how if item.strip()],
-            "influence_factors": self.infer_influence_factors(ir),
-            "lifecycle": ir.when.strip() if ir.when else None,
+            "actions": actions,
+            "influence_factors": influence_factors,
+            "lifecycle": lifecycle,
             "constraints": constraints,
             "dfx": _quality_values(ir),
             "owner": ir.owner.strip() if ir.owner else self.default_owner,
@@ -284,10 +301,38 @@ class SpecCatalog:
         return {
             "draft": draft,
             "missing_required_fields": self.validate_scenario_payload(draft),
+            "inferred_fields": inferred_fields,
             "mapping": self._payload.get("ir_to_scenario_mapping", []),
             "identification_views": self._payload.get("identification_views", []),
             "quality_outputs": self.quality_outputs,
         }
+
+    def _infer_lifecycle_from_ir(self, ir: IRRequirementInput) -> tuple[str | None, str | None]:
+        """Infer a lifecycle only when the IR's other text contains Spec evidence."""
+
+        corpus = " ".join(
+            [ir.title, ir.description, ir.what or "", ir.why or "", *ir.how, *ir.constraints, *ir.tags]
+        ).casefold()
+        categories = self.matching_rules.get("lifecycle_categories", {})
+        if not isinstance(categories, dict):
+            return None, None
+        labels = {
+            "normal_service": "正常服务",
+            "maintenance": "维护",
+            "deployment": "部署",
+            "upgrade": "升级",
+            "retirement": "退网",
+            "fault_recovery": "故障恢复",
+        }
+        for category, terms in categories.items():
+            if not isinstance(terms, (list, tuple)):
+                continue
+            for term in terms:
+                marker = str(term).strip()
+                if marker and marker.casefold() in corpus:
+                    lifecycle = labels.get(str(category), marker)
+                    return lifecycle, f"lifecycle ← IR 描述中的“{marker}”"
+        return None, None
 
     def draft_use_case(self, ir: IRRequirementInput, scenario: Any) -> dict[str, Any]:
         scenario_id = _read(scenario, "id")
@@ -400,7 +445,7 @@ def _extension_candidates(ir: IRRequirementInput) -> list[str]:
 
 def _fallback_spec() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 3,
         "name": "IR→SC→UC需求分析规范",
         "pipeline": ["IR", "SC", "UC", "FUNCTION_IMPACT", "SR"],
         "categories": ["Scenario Directory", "Scenario", "派生场景"],
@@ -412,9 +457,21 @@ def _fallback_spec() -> dict[str, Any]:
             "scenario_strong_threshold": 0.70,
             "use_case_reuse_threshold": 0.45,
             "ambiguity_margin": 0.08,
+            "scenario_reuse_min_evidence_completeness": 0.60,
+            "use_case_reuse_min_evidence_completeness": 0.70,
+            "field_precision_blend_weight": 0.60,
             "lexical_weight": 0.75,
             "tfidf_weight": 0.25,
             "embedding_weight": 0.20,
+            "required_ir_fields": ["who", "what"],
+            "uc_dimension_weights": {
+                "目标/行为": 0.30,
+                "Actor": 0.10,
+                "触发/前置": 0.20,
+                "处理步骤": 0.20,
+                "保证/DFX": 0.12,
+                "约束": 0.08,
+            },
             "synonyms": {
                 "异常恢复": ["故障恢复", "恢复节点", "复位修复"],
                 "隔离": ["下电隔离", "节点隔离", "故障隔离"],

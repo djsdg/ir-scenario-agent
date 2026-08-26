@@ -46,8 +46,16 @@ class IRRequirementInput(BaseModel):
     delivery_time: str | None = Field(default=None, max_length=1_000)
     tags: list[str] = Field(default_factory=list, max_length=50)
 
-    def missing_fields(self) -> list[str]:
-        required = {
+    def missing_fields(self, required_fields: tuple[str, ...] | list[str] | None = None) -> list[str]:
+        """Return missing mandatory 5W2H fields.
+
+        The IR contract intentionally keeps only ``who`` and ``what`` mandatory.
+        The other 5W2H fields are valuable matching evidence, but an IR may omit
+        them and still be used to infer SC candidates from its title,
+        description, DFX, constraints, and supplied fields.
+        """
+
+        values = {
             "who": self.who,
             "when": self.when,
             "where": self.where,
@@ -56,7 +64,33 @@ class IRRequirementInput(BaseModel):
             "why": self.why,
             "how_much": self.how_much,
         }
-        return [name for name, value in required.items() if not value]
+        required = required_fields if required_fields is not None else ("who", "what")
+        return [
+            name
+            for name in required
+            if name in values and not _has_value(values[name])
+        ]
+
+    def missing_optional_fields(
+        self, required_fields: tuple[str, ...] | list[str] | None = None
+    ) -> list[str]:
+        """Return absent optional 5W2H fields without treating them as blockers."""
+
+        values = {
+            "who": self.who,
+            "when": self.when,
+            "where": self.where,
+            "what": self.what,
+            "how": self.how,
+            "why": self.why,
+            "how_much": self.how_much,
+        }
+        required = set(required_fields if required_fields is not None else ("who", "what"))
+        return [
+            name
+            for name, value in values.items()
+            if name not in required and not _has_value(value)
+        ]
 
     def search_text(self) -> str:
         values: list[str] = [self.title, self.description]
@@ -68,6 +102,12 @@ class IRRequirementInput(BaseModel):
         values.extend(self.constraints)
         values.extend(self.tags)
         return " ".join(values)
+
+
+def _has_value(value: object) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
 
 
 class InformationRequirement(IRRequirementInput):
@@ -166,6 +206,12 @@ class ScenarioMatch(BaseModel):
     matched_dimensions: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
+    # ``score`` is the conservative decision score across the full SC model.
+    # ``fit_score`` only evaluates fields actually supplied by the IR; together
+    # with evidence_completeness it prevents empty optional fields from being
+    # mistaken for a mismatch or from being silently ignored.
+    fit_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_completeness: float = Field(default=0.0, ge=0.0, le=1.0)
     base_score: float = Field(default=0.0, ge=0.0, le=1.0)
     consistency_bonus: float = Field(default=0.0, ge=0.0, le=1.0)
     evaluation: str = Field(default="未评价", max_length=100)
@@ -180,7 +226,12 @@ class UseCaseMatch(BaseModel):
     score: float = Field(ge=0.0, le=1.0)
     matched_terms: list[str] = Field(default_factory=list)
     matched_fields: dict[str, list[str]] = Field(default_factory=dict)
+    matched_dimensions: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
     parent_scenario_id: str | None = None
+    fit_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_completeness: float = Field(default=0.0, ge=0.0, le=1.0)
     base_score: float = Field(default=0.0, ge=0.0, le=1.0)
     consistency_bonus: float = Field(default=0.0, ge=0.0, le=1.0)
     evaluation: str = Field(default="未评价", max_length=100)
@@ -197,6 +248,8 @@ class IRMatchResult(BaseModel):
     use_case_matches: list[UseCaseMatch]
     decision: MatchDecision
     confidence: float = Field(ge=0.0, le=1.0)
+    evidence_completeness: float = Field(default=0.0, ge=0.0, le=1.0)
+    supplied_dimensions: list[str] = Field(default_factory=list, max_length=20)
     score_margin: float = Field(default=0.0, ge=0.0, le=1.0)
     ambiguous: bool = False
     confidence_label: str = Field(default="未评价", max_length=100)

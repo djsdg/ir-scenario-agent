@@ -23,7 +23,12 @@ from .mcp import MCPConfig
 from .memory import MemoryStore
 from .plugins import PluginContext, PluginManager
 from .retrieval import OpenAIEmbeddingProvider
-from .reporting import build_analysis_report, save_run_report
+from .reporting import (
+    apply_human_review,
+    build_analysis_report,
+    save_reviewed_report,
+    save_run_report,
+)
 from .skills import SkillCatalog
 from .specs import SpecCatalog, SpecError
 from .sqlite_library import migrate_json_to_sqlite
@@ -96,6 +101,21 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Copy the selected JSON/directory library to a SQLite database and exit",
     )
+    parser.add_argument(
+        "--apply-review",
+        metavar="CSV",
+        help="Merge a human-edited human_review_template.csv into a report JSON and exit",
+    )
+    parser.add_argument(
+        "--review-report",
+        metavar="PATH",
+        help="Report JSON used with --apply-review (normally evaluation/report.json's parent report.json)",
+    )
+    parser.add_argument(
+        "--review-output",
+        metavar="PATH",
+        help="Output JSON for --apply-review; defaults to reviewed_report.json next to the input report",
+    )
     return parser
 
 
@@ -150,7 +170,8 @@ def _print_result(
         if matching:
             print(
                 f"匹配评价：{matching.get('confidence_label', '未评价')} "
-                f"（分数信号 {float(matching.get('confidence', 0.0) or 0.0):.2f}）"
+                f"（决策分 {float(matching.get('confidence', 0.0) or 0.0):.2f}；"
+                f"IR证据完整度 {float(matching.get('evidence_completeness', 0.0) or 0.0):.2f}）"
             )
             for reason in matching.get("confidence_reasons") or []:
                 print(f"置信度原因：{reason}")
@@ -169,9 +190,9 @@ def _print_result(
                 f"{_format_match_fields(item.get('matched_fields'))}"
             )
             print(
-                f"  评分构成：基础分 {float(item.get('base_score', 0.0) or 0.0):.2f} + "
-                f"一致性加分 {float(item.get('consistency_bonus', 0.0) or 0.0):.2f} "
-                f"= {float(item.get('score', 0.0) or 0.0):.2f}；"
+                f"  评分：决策分 {float(item.get('score', 0.0) or 0.0):.2f}；"
+                f"可用证据匹配度 {float(item.get('fit_score', 0.0) or 0.0):.2f}；"
+                f"证据完整度 {float(item.get('evidence_completeness', 0.0) or 0.0):.2f}；"
                 f"评价：{item.get('evaluation', '未评价')}"
             )
             print("\n".join(_format_dimension_scores(item.get("dimension_scores"))))
@@ -192,9 +213,9 @@ def _print_result(
                 f"{_format_match_fields(item.get('matched_fields'))}"
             )
             print(
-                f"  评分构成：基础分 {float(item.get('base_score', 0.0) or 0.0):.2f} + "
-                f"一致性加分 {float(item.get('consistency_bonus', 0.0) or 0.0):.2f} "
-                f"= {float(item.get('score', 0.0) or 0.0):.2f}；"
+                f"  评分：决策分 {float(item.get('score', 0.0) or 0.0):.2f}；"
+                f"可用证据匹配度 {float(item.get('fit_score', 0.0) or 0.0):.2f}；"
+                f"证据完整度 {float(item.get('evidence_completeness', 0.0) or 0.0):.2f}；"
                 f"评价：{item.get('evaluation', '未评价')}"
             )
             print("\n".join(_format_dimension_scores(item.get("dimension_scores"))))
@@ -297,6 +318,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"SQLite 迁移失败：{exc}", file=sys.stderr)
             return 2
         print(f"SQLite 场景库已创建：{migrated.path.resolve()}")
+        return 0
+
+    if args.apply_review:
+        if not args.review_report:
+            print("--apply-review 必须同时提供 --review-report。", file=sys.stderr)
+            return 2
+        try:
+            report_path = Path(args.review_report).expanduser()
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+            report = payload.get("report") if isinstance(payload, dict) else None
+            if not isinstance(report, dict):
+                report = payload
+            if not isinstance(report, dict):
+                raise ValueError("输入 JSON 不是分析报告。")
+            reviewed = apply_human_review(report, args.apply_review)
+            output_path = (
+                Path(args.review_output).expanduser()
+                if args.review_output
+                else report_path.with_name("reviewed_report.json")
+            )
+            saved = save_reviewed_report(reviewed, output_path)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"人工复核回填失败：{exc}", file=sys.stderr)
+            return 2
+        print(f"人工复核已回填：{saved}")
+        print(f"Markdown：{saved.with_suffix('.md')}")
         return 0
 
     if args.validate_library:

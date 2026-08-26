@@ -56,6 +56,7 @@ class TUITests(unittest.TestCase):
                     self.assertIsNotNone(app.query_one("#output-panel"))
                     self.assertIsInstance(app.query_one("#conversation"), tui._CopyableTextArea)
                     self.assertIsInstance(app.query_one("#candidates"), tui._CopyableTextArea)
+                    self.assertIsInstance(app.query_one("#human-review"), tui._CopyableTextArea)
                     self.assertIsInstance(app.query_one("#tools"), tui._CopyableTextArea)
                     self.assertIsNotNone(app.query_one("#candidate-table", tui.DataTable))
                     self.assertIsNotNone(app._last_output_path)

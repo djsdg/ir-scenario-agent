@@ -27,14 +27,15 @@
   - `transition_record`：按 Draft → Inwork → Review → Publish → Obsolete 流转 SC/UC 状态。
   - `move_use_case`：迁移 UC 的唯一父 SC，并同步更新两侧 revision。
 - 匹配结果区分四种决策：复用场景和 UC、复用场景但新增 UC、新增场景和 UC、信息不足待澄清。
-- 完整 IR 匹配会返回候选分差和硬冲突；Actor、生命周期、影响部件或范围明确冲突，或最高/次高候选过于接近时，会转为人工澄清，避免误复用。
+- IR 的 5W2H 中仅 `Who` 和 `What` 为匹配必填项；`When/Where/How/Why/How Much` 缺失时仍会基于标题、描述、约束、DFX 和已提供字段推断 SC 候选，并明确标注推断依据。SC/UC 写入前的自身必填校验不受影响。
+- IR 匹配会返回候选分差和硬冲突；Actor、生命周期、影响部件或范围存在明确冲突，或最高/次高候选过于接近时，会转为人工澄清，避免误复用。
 - 匹配保留中文单字、二/三字短语和 How Much/DFX 证据，并按字段返回命中证据，例如 `Actor[本系统]`、`影响因素[部件/节点]`、`主成功场景[检测/隔离]`；Actor、上下文、影响因素等关键维度未覆盖时，即使总分较高也不会自动复用。
 - 完整 IR 使用 `match_ir_requirement`；单独维护 SC/UC 时分别使用 `match_scenario`/`match_use_case`。独立匹配是只读建议，实际新建仍需调用对应写入工具并经过审批。
 - 支持一个 IR 返回多个场景候选、一个 SC 关联多个 UC；每个 UC 只能归属一个父 SC。新增时按单个 SC/UC 草稿分别审批，避免把独立行为链强行合并。
 - 使用 `config/ir_sc_uc_spec.json` 约束 IR→SC→UC 映射、场景类别/状态、六类影响因素维度和质量输出；不把 IR 直接当 SC。
 - Spec 的 `matching` 段可配置复用阈值、候选歧义分差和领域同义词/冲突词；更换业务领域时优先改配置，不必修改匹配代码。
 - 匹配默认使用关键词证据 + TF-IDF 的混合检索，并支持 Spec 同义词；设置 `IR_AGENT_EMBEDDING_MODEL` 后会叠加 OpenAI 兼容 Embedding，服务不可用时自动回退。
-- 匹配结果不是只给一个不可解释的置信度：SC 会展示“目标/行为、Actor、上下文、影响因素、约束”各维度的分数、权重、加权分、证据、评价和低分原因；UC 会展示“行为链、名称”维度。分数是确定性的匹配信号，不是概率。
+- 匹配结果不是只给一个不可解释的置信度：SC 会展示“目标/行为、Actor、上下文、影响因素、约束”各维度的分数、权重、加权分、证据、评价和低分原因；UC 会展示“行为链、名称”维度。分数是确定性的匹配信号，不是概率。人工复核字段表固定展示得分最高的两个 SC 候选，即使未达到复用阈值。
 - 场景硬性校验 `description`、`category`、`business_goal`、`actor`、`actions`、`lifecycle`、`constraints`、`influence_factors`、`owner`；影响因素至少有一个选中值。
 - UC 硬性校验前置条件、触发事件、成功/最小保证和主成功场景，拒绝写入空壳 UC。
 - 支持项目级 Skill：从 `skills/**/SKILL.md` 自动发现、按需求选择，也可以由 agent 搜索/加载。
@@ -63,8 +64,10 @@
 - UC 命中了哪些字段：前置条件、触发事件、主成功场景、成功保证、DFX 等；
 - 每个 UC 的父 SC，以及一个 SC 下的多个 UC；
 - 缺口和冲突，而不是只显示一个分数。
-- 总分构成：基础分、维度加权分和一致性加分；每个维度附带命中证据、文字评价和低分原因。
+- 每个候选同时展示：用于阈值决策的保守分、仅在可用 IR 证据（含可追溯文本推断）上的匹配度，以及 IR 证据完整度；不再按“命中维度数量”给予固定加分。每个维度附带命中证据、文字评价和低分原因。
 - 指定 SC 的符合度测试结果，以及“信息不足/需人工确认/候选可复用/强匹配/建议新增”等置信度评价。
+- 人工复核区先展示候选总览，再按候选分组展示字段明细；`human_review_template.csv` 可在 Excel 中填写人工字段值、一致性、复核状态、人工结论和备注，`human_review_matrix.csv` 提供两个候选的横向对比视图。
+- 人工复核 CSV 默认只回填报告，不会静默修改场景库；回填完成后会生成新的 JSON/Markdown 报告，便于保留 AI 原始结果和人工结论的差异。
 
 一次运行的输出目录结构类似：
 
@@ -77,7 +80,8 @@ data/outputs/<session_id>/<timestamp>_<id>/
 ├── evaluation/
 │   ├── match_summary.csv              # SC/UC 总分、维度分数、低分原因
 │   ├── field_comparison.csv           # AI 字段、依据、Spec/方法、人工值、一致性
-│   ├── human_review_template.csv      # 可交给人工补填的复核模板
+│   ├── human_review_template.csv      # 逐候选逐字段的可编辑复核模板
+│   ├── human_review_matrix.csv         # 两个 SC 候选的横向字段对比模板
 │   └── scenario_fit.csv               # 指定 SC 符合度测试结果
 ├── scenarios/
 │   ├── matches.json
@@ -92,6 +96,16 @@ data/outputs/<session_id>/<timestamp>_<id>/
     └── by_scenario/
         └── SCN-XXXX-001.json
 ```
+
+人工填写 `human_review_template.csv` 后，可以把结论回填为一份新的报告（不会写场景库）：
+
+```powershell
+ir-agent --apply-review .\evaluation\human_review_template.csv `
+  --review-report .\report.json `
+  --review-output .\reviewed_report.json
+```
+
+允许的 `consistency` 为 `一致/部分一致/不一致/无法判断`，`review_status` 为 `待复核/已确认/需新增/需修改`；`human_decision` 为 `复用/部分复用/不复用/新增场景/修改后复用/待定`。
 
 如果用户明确要求“新增场景/UC”或“更新场景/UC”，并通过审批，写入工具会直接更新原场景库；上述输出目录保存的是本轮分析和写入后的快照，不会替代原库。CLI 可以指定输出根目录：
 
@@ -174,7 +188,7 @@ ir-agent-tui --ir-path .\examples\ir_sanitized.txt --library .\data\scenario_lib
 - `IR 文档路径`：支持 `.txt`、`.md`、`.json`、`.docx`、`.pdf`；
 - `场景库路径`：可以填写单个 JSON 文件，也可以填写场景库目录。填写目录时自动使用目录下的 `scenarios.json` 和 `uc/use_cases.json`。
 
-点击“读取 IR 并发送”后，程序会先校验两个路径、读取 IR，再用该场景库执行匹配；也可以继续直接粘贴文本并点击“发送”。输出区分为“对话”“候选对比”“工具日志”三个视图；“候选对比”分别展示 SC 表和按父 SC 过滤的 UC 表，包含名称、分数、命中维度、缺口和冲突，下方保留逐项解释。点击表格行后可以加入一个或多个 SC/UC，填充确认/编辑提示，或确认后继续发送；“检查库质量”按钮会直接触发只读审计。右侧显示本轮决策摘要，并提供打开结果文件/输出目录按钮。使用 `Ctrl+L` 清空输出显示，`Ctrl+Q` 退出。每轮结果会保存到 `IR_AGENT_OUTPUT_DIR/<session_id>/`，界面会显示绝对输出路径；当前生效的场景库、UC 库、Spec、输出目录和审计日志路径也会显示在右侧。TUI 默认仍会对场景库/记忆写入和 MCP 调用弹窗确认；本地调试时可使用 `--auto-approve-writes` 自动批准写入。
+点击“读取 IR 并发送”后，程序会先校验两个路径、读取 IR，再用该场景库执行匹配；也可以继续直接粘贴文本并点击“发送”。输出区分为“对话”“候选对比”“人工复核”“工具日志”四个视图；“候选对比”分别展示 SC 表和按父 SC 过滤的 UC 表，包含名称、决策分、可用证据匹配度、证据完整度、命中维度、缺口和冲突，下方保留逐项解释。“人工复核”先给出候选总览和待核对字段，点击“打开复核表”可以直接打开可编辑 CSV。点击表格行后可以加入一个或多个 SC/UC，填充确认/编辑提示，或确认后继续发送；“检查库质量”按钮会直接触发只读审计。右侧显示本轮决策摘要，并提供打开结果文件/输出目录按钮。使用 `Ctrl+L` 清空输出显示，`Ctrl+Q` 退出。每轮结果会保存到 `IR_AGENT_OUTPUT_DIR/<session_id>/`，界面会显示绝对输出路径；当前生效的场景库、UC 库、Spec、输出目录和审计日志路径也会显示在右侧。TUI 默认仍会对场景库/记忆写入和 MCP 调用弹窗确认；本地调试时可使用 `--auto-approve-writes` 自动批准写入。
 
 本地库检查和迁移不需要调用大模型：
 
@@ -259,7 +273,8 @@ ir-agent --no-memory
 | 目标、Actor、生命周期、影响因素、约束一致，已有 UC 覆盖触发—处理—保证 | 复用 SC + UC |
 | 场景边界一致，但新增了触发条件、处理分支或保证 | 复用 SC，新增 UC |
 | Actor、生命周期、业务目标或影响因素不兼容 | 新增 SC，再新增 UC |
-| IR 的 Who/When/Where/What/How/Why/How Much，或 SC/UC 必填项缺失 | 只返回待补字段，不写入 |
+| IR 缺少 Who 或 What，或 SC/UC 写入必填项缺失 | 返回待补字段，不写入 |
+| IR 的其他 5W2H 字段缺失 | 继续按标题、描述、Who、What、约束和 DFX 匹配/推断 SC；写入前仍需补齐 SC/UC 自身必填项 |
 
 `data/scenario_library.json` 已包含脱敏的 `IR-XXXX-001`、`SCN-XXXX-001/002`、`UC-XXXX-001/002`，可以直接用于本地匹配测试。SC 通过 `use_case_ids` 维护其子 UC；新建 UC 时使用唯一的 `scenario_id` 指定父 SC。
 

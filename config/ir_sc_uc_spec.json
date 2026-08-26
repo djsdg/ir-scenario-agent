@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 3,
   "name": "IR→SC→UC需求分析规范",
   "pipeline": ["IR", "SC", "UC", "FUNCTION_IMPACT", "SR"],
   "relationship_constraints": {
@@ -12,15 +12,27 @@
     "scenario_strong_threshold": 0.70,
     "use_case_reuse_threshold": 0.45,
     "ambiguity_margin": 0.08,
+    "scenario_reuse_min_evidence_completeness": 0.60,
+    "use_case_reuse_min_evidence_completeness": 0.70,
+    "field_precision_blend_weight": 0.60,
     "lexical_weight": 0.75,
     "tfidf_weight": 0.25,
     "embedding_weight": 0.20,
+    "required_ir_fields": ["who", "what"],
     "ir_dimension_weights": {
       "目标/行为": 0.45,
       "Actor": 0.15,
       "上下文": 0.15,
       "影响因素": 0.15,
       "约束": 0.10
+    },
+    "uc_dimension_weights": {
+      "目标/行为": 0.30,
+      "Actor": 0.10,
+      "触发/前置": 0.20,
+      "处理步骤": 0.20,
+      "保证/DFX": 0.12,
+      "约束": 0.08
     },
     "synonyms": {
       "异常恢复": ["故障恢复", "恢复节点", "复位修复"],

@@ -9,8 +9,8 @@ from pathlib import Path
 from ir_agent.domain import (
     CreateScenarioRequest,
     CreateUseCaseRequest,
-    IRRequirementInput,
     InfluenceFactor,
+    IRRequirementInput,
     MoveUseCaseRequest,
     TransitionRecordRequest,
     UpdateScenarioRequest,
@@ -134,7 +134,11 @@ class ScenarioLibraryTests(unittest.TestCase):
         self.assertIn("Actor", result.scenario_matches[0].matched_fields)
         self.assertTrue(result.scenario_matches[0].matched_fields["Actor"])
         self.assertGreaterEqual(result.scenario_matches[0].base_score, 0.0)
-        self.assertGreaterEqual(result.scenario_matches[0].consistency_bonus, 0.0)
+        self.assertEqual(result.scenario_matches[0].consistency_bonus, 0.0)
+        self.assertGreaterEqual(
+            result.scenario_matches[0].fit_score,
+            result.scenario_matches[0].score,
+        )
         self.assertTrue(result.scenario_matches[0].dimension_scores)
         self.assertTrue(result.confidence_label)
         self.assertTrue(
@@ -151,6 +155,38 @@ class ScenarioLibraryTests(unittest.TestCase):
         )
         if result.ambiguous:
             self.assertLess(result.score_margin, 0.08)
+
+    def test_match_separates_fit_score_from_evidence_completeness(self) -> None:
+        result = self.library.match_ir(
+            IRRequirementInput(
+                title="某指令异常检测改进",
+                description="提升异常检测能力。",
+                who="本系统",
+                what="改进某指令异常检测机制",
+            ),
+            top_k=3,
+        )
+
+        self.assertTrue(result.scenario_matches)
+        self.assertAlmostEqual(result.evidence_completeness, 0.60)
+        self.assertEqual(result.supplied_dimensions, ["目标/行为", "Actor"])
+        top = result.scenario_matches[0]
+        self.assertAlmostEqual(top.evidence_completeness, 0.60)
+        self.assertGreater(top.fit_score, top.score)
+        self.assertEqual(top.consistency_bonus, 0.0)
+
+    def test_ir_to_uc_matching_compares_behavior_contract_fields(self) -> None:
+        result = self.library.match_ir(self.library.get_requirement("IR-TEST-001"), top_k=3)
+
+        self.assertTrue(result.use_case_matches)
+        top = result.use_case_matches[0]
+        self.assertEqual(
+            set(top.dimension_scores),
+            {"目标/行为", "Actor", "触发/前置", "处理步骤", "保证/DFX", "约束"},
+        )
+        self.assertGreater(top.dimension_scores["触发/前置"].score, 0.0)
+        self.assertIn("处理步骤", top.matched_dimensions)
+        self.assertAlmostEqual(top.evidence_completeness, 1.0)
 
     def test_evaluate_scenario_fit_returns_explainable_dimension_scores(self) -> None:
         ir = self.library.get_requirement("IR-XXXX-001")
@@ -216,6 +252,23 @@ class ScenarioLibraryTests(unittest.TestCase):
 
         self.assertEqual(result.decision, "needs_clarification")
         self.assertIn("who", result.missing_ir_fields)
+        self.assertIn("what", result.missing_ir_fields)
+
+    def test_only_who_and_what_are_required_for_ir_matching(self) -> None:
+        result = self.library.match_ir(
+            IRRequirementInput(
+                title="某指令异常检测机制改进",
+                description="系统正常运行时，某部件异常导致关键进程反复复位。",
+                who="本系统",
+                what="改进某指令异常检测机制",
+            ),
+            top_k=3,
+        )
+
+        self.assertEqual(result.missing_ir_fields, [])
+        self.assertTrue(result.scenario_matches)
+        self.assertFalse(any("缺少必填字段" in item for item in result.rationale))
+        self.assertTrue(any("可选 5W2H 字段" in item for item in result.rationale))
 
     def test_create_use_case_links_existing_scenario(self) -> None:
         created = self.library.create_use_case(

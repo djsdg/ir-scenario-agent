@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from ir_agent.documents import read_document
+from ir_agent.domain import IRRequirementInput
 from ir_agent.library import ScenarioLibrary
 from ir_agent.specs import SpecCatalog
 from ir_agent.tools import ToolRegistry
@@ -40,6 +41,8 @@ class SpecAndDocumentTests(unittest.TestCase):
 
         self.assertEqual(rules["scenario_reuse_threshold"], 0.45)
         self.assertEqual(rules["scenario_strong_threshold"], 0.70)
+        self.assertEqual(rules["scenario_reuse_min_evidence_completeness"], 0.60)
+        self.assertIn("处理步骤", rules["uc_dimension_weights"])
         self.assertIn("system", rules["actor_categories"])
         self.assertIn("normal_service", rules["lifecycle_categories"])
 
@@ -51,6 +54,22 @@ class SpecAndDocumentTests(unittest.TestCase):
         self.assertEqual(result["missing_required_fields"], [])
         self.assertEqual(result["scenario_id"], "SCN-XXXX-001")
         self.assertTrue(result["draft"]["main_success_scenario"])
+
+    def test_spec_infers_scenario_fields_from_minimal_ir(self) -> None:
+        result = self.spec.draft_scenario(
+            IRRequirementInput(
+                title="节点异常检测",
+                description="系统正常运行时，某节点出现异常。",
+                who="本系统",
+                what="检测并隔离节点异常",
+            )
+        )
+
+        self.assertEqual(result["draft"]["actions"], ["检测并隔离节点异常"])
+        self.assertEqual(result["draft"]["lifecycle"], "正常服务")
+        self.assertTrue(result["draft"]["influence_factors"])
+        self.assertIn("actions ← what", result["inferred_fields"])
+        self.assertTrue(any(item.startswith("lifecycle ←") for item in result["inferred_fields"]))
 
     def test_draft_tools_are_read_only_and_return_parent_scenario_alternatives(self) -> None:
         registry = ToolRegistry(self.library, spec=self.spec)
